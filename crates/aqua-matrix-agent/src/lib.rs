@@ -5,16 +5,15 @@
 #![recursion_limit = "256"]
 
 mod call;
-mod durable;
 mod media;
 mod recovery;
 mod registry;
 mod rtc_keys;
 
-pub use durable::{WorkItem, WorkJournal, WorkState};
 pub use media::{MediaHandle, MediaKind};
 pub use rtc_keys::{
-    CallEncryptionKeys, CallEncryptionKeysEventContent, CallKey, CALL_ENCRYPTION_KEYS_TYPE,
+    build_call_encryption_keys_content, element_call_accepts_encryption_keys, CallEncryptionKeys,
+    CallEncryptionKeysEventContent, CallKey, CALL_ENCRYPTION_KEYS_TYPE,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -194,17 +193,6 @@ pub struct AgentClient {
     /// MatrixSession refresh hits Synapse's native endpoint, not siwx-oidc's
     /// `/token`), so the rotation has to happen at this layer.
     config: AgentConfig,
-    /// Durable work-journal for the delivery+inbox promise, injected by the relay
-    /// (`run_daemon`) so a handler running on a *clone* of this client can record
-    /// its answer/error durably ([`record_reply`](Self::record_reply)) and mark it
-    /// delivered ([`mark_delivered`](Self::mark_delivered)). `None` for one-shot
-    /// CLI use, where there is no daemon lifecycle to redeliver.
-    journal: Option<std::sync::Arc<WorkJournal>>,
-    /// Signalled by a handler ([`request_recycle`](Self::request_recycle)) when a
-    /// live delivery failed, so `run_daemon` ends the current cycle and reconnects
-    /// with a fresh token to redeliver the journalled reply within seconds rather
-    /// than waiting for the next scheduled cycle.
-    recycle: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl AgentClient {
@@ -217,50 +205,6 @@ impl AgentClient {
 
     pub fn expires_at_unix(&self) -> u64 {
         self.expires_at_unix
-    }
-
-    /// Inject the durable work-journal and recycle signal (called once per cycle by
-    /// the relay, before the client is cloned into handlers). After this, a handler
-    /// holding a clone can durably record and complete its replies.
-    pub fn attach_durability(
-        &mut self,
-        journal: std::sync::Arc<WorkJournal>,
-        recycle: std::sync::Arc<tokio::sync::Notify>,
-    ) {
-        self.journal = Some(journal);
-        self.recycle = Some(recycle);
-    }
-
-    /// Whether a durable journal is attached (daemon mode). Handlers use this to
-    /// decide between the durable promise path and a plain one-shot send.
-    pub fn has_journal(&self) -> bool {
-        self.journal.is_some()
-    }
-
-    /// Durably record the answer/error for the inbound message `event_id` so it is
-    /// guaranteed to be delivered (redelivered by the relay across restarts/token
-    /// rotation) even if the live send below fails. No-op without a journal.
-    pub fn record_reply(&self, event_id: &str, text: &str) {
-        if let Some(j) = &self.journal {
-            j.set_to_deliver(event_id, text);
-        }
-    }
-
-    /// Mark the inbound message `event_id` fully handled — its answer/error has been
-    /// confirmed delivered. Removes it from the durable inbox. No-op without a journal.
-    pub fn mark_delivered(&self, event_id: &str) {
-        if let Some(j) = &self.journal {
-            j.mark_done(event_id);
-        }
-    }
-
-    /// Ask `run_daemon` to end the current cycle and reconnect now (fresh token), so
-    /// a journalled-but-undelivered reply is redelivered within seconds. No-op if no
-    /// recycle signal is attached.
-    pub fn request_recycle(&self) {
-        if let Some(r) = &self.recycle {
-            r.notify_one();
-        }
     }
 }
 
@@ -1009,8 +953,6 @@ impl AgentClient {
             user_id,
             expires_at_unix,
             config,
-            journal: None,
-            recycle: None,
         })
     }
 
@@ -1338,19 +1280,6 @@ impl AgentClient {
         retry_finalize("send-dm", || self.send_dm(target, message)).await
     }
 
-    /// Reliably send `message`, splitting it at clean boundaries into as many
-    /// messages as needed so no single event approaches Matrix's size cap
-    /// (`413 M_TOO_LARGE`). Use for a long one-shot reply that did not stream.
-    /// Each chunk is sent with [`send_dm_reliable`](Self::send_dm_reliable); the
-    /// last delivered event id is returned. See [`split_for_matrix`].
-    pub async fn send_dm_chunked(&self, target: &str, message: &str) -> Result<String> {
-        let mut last = String::new();
-        for chunk in split_for_matrix(message, STREAM_ROLLOVER_BYTES) {
-            last = self.send_dm_reliable(target, &chunk).await?;
-        }
-        Ok(last)
-    }
-
     /// Send a Markdown message into an **arbitrary already-joined room** (by room
     /// id), NOT a DM. The agent must already be a member of `room_id` (it is — it
     /// joined the owner's room to transcribe the call). Unlike [`send_dm`], this
@@ -1646,40 +1575,8 @@ impl AgentClient {
 /// flood the room with events (each a separate, E2E-encrypted `m.replace`); one
 /// edit every ~700ms reads as smooth typing without the spam.
 const STREAM_EDIT_INTERVAL: Duration = Duration::from_millis(700);
-
-/// Soft cap on the markdown held in a *single* streamed message. Past this the
-/// stream **rolls over**: the current message is finalized at a clean boundary
-/// (never mid-sentence) and a fresh message continues the reply
-/// (see [`ReplyStream::push`] / [`split_for_matrix`]).
-///
-/// Why this sits so far below Matrix's 65,536-byte hard event cap: a streamed
-/// reply is delivered as an `m.replace` **edit** of **markdown**, **E2E-encrypted**.
-/// Each of those multiplies the wire size of the body —
-///   * markdown gains an HTML `formatted_body` (≈1.2–1.5× for prose, more for lists/code),
-///   * an edit embeds a full **second copy** of the content in `m.new_content` (≈2×),
-///   * Megolm encryption base64-expands the whole event (≈1.33×).
-/// So `B` bytes of markdown become roughly `2 × 1.4 × 1.33 × B ≈ 3.7·B` (plus JSON
-/// overhead) on the wire. At the old 16,000-byte cap that reached ~60–120 KB and
-/// tripped **413 M_TOO_LARGE**; 6,000 B keeps even a heavily-formatted encrypted
-/// edit comfortably under 64 KiB.
-const STREAM_ROLLOVER_BYTES: usize = 6_000;
-
-/// Don't finalize a rolled-over message smaller than this — avoids a flurry of
-/// tiny messages when an early paragraph break would otherwise win. The splitter
-/// prefers the *largest* clean boundary ≤ budget, falling back through boundary
-/// kinds (paragraph → line → sentence → word → hard cut).
-const STREAM_MIN_SPLIT_BYTES: usize = 1_500;
-
-/// Safety bound on how many messages one reply may fan out into, so a runaway
-/// (or adversarial) output cannot flood a room. Beyond this the tail is truncated.
-const STREAM_MAX_MESSAGES: usize = 50;
-
-/// Hold the FIRST message of a streamed reply back until the buffer carries at
-/// least this many bytes, so the receiver's push notification previews the first
-/// lines of the answer instead of a bare placeholder. The typing indicator covers
-/// the brief wait; a short reply that never reaches this is sent whole by
-/// [`ReplyStream::finish`]. ~120 bytes ≈ a line or two — enough to be meaningful.
-const FIRST_MESSAGE_MIN_BYTES: usize = 120;
+/// Cap on a streamed reply's size. Matrix accepts more, but be polite.
+const STREAM_MAX_BYTES: usize = 16_000;
 
 /// The *final* transmission of a reply must not be silently dropped: throttled
 /// intermediate edits are best-effort (each is superseded by the next), but the
@@ -1773,233 +1670,98 @@ impl Drop for TypingGuard {
 /// [`AgentClient::reply_stream`]. Backed by one message plus throttled
 /// `m.replace` edits — the official Matrix way to approximate streaming, since
 /// the protocol has no token-stream primitive.
-///
-/// When a reply outgrows [`STREAM_ROLLOVER_BYTES`] it transparently **rolls over**
-/// onto a new message at a clean boundary, so an arbitrarily long answer is
-/// delivered as a sequence of readable messages and no single edit can ever
-/// exceed Matrix's event-size cap (the `413 M_TOO_LARGE` failure mode).
 pub struct ReplyStream {
     room: matrix_sdk::Room,
-    /// The *current* (still editable) message; rollover advances this. `None`
-    /// until the first message is actually sent — we hold it back (see
-    /// [`FIRST_MESSAGE_MIN_BYTES`]) so the receiver's push notification previews
-    /// real text rather than a bare placeholder.
-    event_id: Option<OwnedEventId>,
-    /// Markdown shown in the current message only (earlier rolled-over messages
-    /// are already finalized and frozen).
+    event_id: OwnedEventId,
     buf: String,
     last_edit: Instant,
     pending: bool,
-    /// How many messages this reply has opened so far (0 before the first send).
-    /// Used to bound fan-out and to know whether any rollover has happened in
-    /// `finish`.
-    messages: usize,
 }
 
 impl ReplyStream {
     async fn start(room: matrix_sdk::Room) -> Result<Self> {
-        // Deliberately send NOTHING yet: a placeholder "…" would fire a push
-        // notification with no content. The first real message is sent by `push`
-        // once the buffer is meaningful, or by `finish` for a short reply. The
-        // caller shows a typing indicator until then.
+        let resp = room
+            .send(RoomMessageEventContent::text_plain("…"))
+            .await
+            .context("failed to send streaming placeholder")?;
         Ok(Self {
             room,
-            event_id: None,
+            event_id: resp.response.event_id.clone(),
             buf: String::new(),
             last_edit: Instant::now(),
             pending: false,
-            messages: 0,
         })
-    }
-
-    /// Whether the first real message has been sent yet. The caller keeps its
-    /// typing indicator up until this is true, so there is no silent gap while the
-    /// first chunk is held back for a meaningful notification.
-    pub fn has_started(&self) -> bool {
-        self.event_id.is_some()
-    }
-
-    /// Send the first message as a NEW message carrying the buffer so far, so the
-    /// receiver's notification previews the first lines. Best-effort: on failure
-    /// we stay un-started and retry on the next `push` / `finish`.
-    async fn send_first(&mut self) {
-        match self.send_new(&render_streaming(&self.buf)).await {
-            Ok(ev) => {
-                self.event_id = Some(ev);
-                self.messages = 1;
-                self.last_edit = Instant::now();
-                self.pending = false;
-            }
-            Err(e) => tracing::warn!("reply-stream: first message send failed (will retry): {e:#}"),
-        }
     }
 
     /// Append `chunk` to the reply, editing the message in place at most once
     /// per [`STREAM_EDIT_INTERVAL`]. Intermediate states get a cursor and
     /// balanced code fences so half-streamed Markdown still renders cleanly.
-    ///
-    /// If the live message outgrows [`STREAM_ROLLOVER_BYTES`] it is finalized at
-    /// a clean boundary and a new message continues the reply — so no edit ever
-    /// approaches the event-size cap.
-    ///
-    /// **Intermediate edits are best-effort and never fail the caller.** A
-    /// transient send error here (including a stray oversize event) is logged and
-    /// swallowed: streaming a reply must never abort the work that is producing
-    /// it. Only [`finish`](Self::finish) (the authoritative last write) surfaces
-    /// errors.
     pub async fn push(&mut self, chunk: &str) -> Result<()> {
         self.buf.push_str(chunk);
         self.pending = true;
-        // No live message yet: hold the first send back until the buffer carries
-        // enough for a meaningful push notification (the first lines). Until then
-        // there is nothing to roll over or edit; the caller's typing indicator
-        // covers the wait.
-        if self.event_id.is_none() {
-            if self.buf.len() >= FIRST_MESSAGE_MIN_BYTES {
-                self.send_first().await;
-            }
-            return Ok(());
-        }
-        // Roll over *before* the next edit, so an oversize edit is never sent.
-        while self.buf.len() > STREAM_ROLLOVER_BYTES && self.messages < STREAM_MAX_MESSAGES {
-            if !self.roll_over().await {
-                break; // couldn't open a continuation; degrade gracefully
-            }
-        }
         if self.last_edit.elapsed() >= STREAM_EDIT_INTERVAL {
             let rendered = render_streaming(&self.buf);
-            self.edit_best_effort(&rendered).await;
+            self.edit(&rendered).await?;
             self.last_edit = Instant::now();
             self.pending = false;
         }
         Ok(())
     }
 
-    /// Finalize the reply across however many messages it spans. `final_text`
-    /// (the authoritative full result) replaces the buffer **only when no
-    /// rollover has happened** — once earlier messages are frozen, replacing the
-    /// whole text would duplicate their content, so the streamed tail is used
-    /// instead. The text is split at clean boundaries into one edit of the
-    /// current message plus any continuation messages, each retried until the
-    /// homeserver acknowledges it (the final write is the one the user keeps).
-    pub async fn finish(self, final_text: Option<&str>) -> Result<()> {
-        let text = if self.messages <= 1 {
-            final_text
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| self.buf.clone())
-        } else {
-            // Rollover already froze the earlier messages with streamed content.
-            self.buf.clone()
-        };
-        let text = if text.trim().is_empty() {
-            "(no output)".to_string()
-        } else {
-            text
-        };
-        let chunks = split_for_matrix(&text, STREAM_ROLLOVER_BYTES);
-        let first = chunks.first().cloned().unwrap_or_default();
-        // If a live message exists, the first chunk replaces it (edit); otherwise
-        // (a short reply held back below the first-flush threshold, or a failed
-        // first send) the first chunk is sent as a brand-new message so it still
-        // lands and notifies meaningfully. The rest are fresh messages. All must
-        // land — retry each until the homeserver acknowledges it.
-        if self.event_id.is_some() {
-            retry_finalize("reply-finalize", || self.edit(&first)).await?;
-        } else {
-            retry_finalize("reply-finalize", || self.send_plain(&first)).await?;
-        }
-        for chunk in chunks.iter().skip(1) {
-            retry_finalize("reply-continuation", || self.send_plain(chunk)).await?;
+    /// Replace the whole body (does not append). Throttled like [`push`].
+    /// Used for progress dashboards that rewrite status in place.
+    pub async fn set(&mut self, text: &str) -> Result<()> {
+        self.buf = text.to_string();
+        self.pending = true;
+        if self.last_edit.elapsed() >= STREAM_EDIT_INTERVAL {
+            let rendered = render_streaming(&self.buf);
+            self.edit(&rendered).await?;
+            self.last_edit = Instant::now();
+            self.pending = false;
         }
         Ok(())
     }
 
-    /// Freeze the current message at a clean boundary and open a fresh one for
-    /// the remainder. Returns `false` (without disturbing state) if a
-    /// continuation message can't be opened, so the caller can degrade instead
-    /// of looping. An open code fence is carried across the split.
-    async fn roll_over(&mut self) -> bool {
-        let cut = pick_boundary(&self.buf, STREAM_ROLLOVER_BYTES);
-        let raw_head = &self.buf[..cut];
-        let head = match raw_head.trim_end() {
-            h if !h.is_empty() => h.to_string(),
-            _ => raw_head.to_string(),
-        };
-        let (head_final, fence_open) = close_open_fence(&head);
-        let tail = self.buf[cut..].trim_start_matches('\n').to_string();
-        let new_buf = if fence_open { format!("```\n{tail}") } else { tail };
-        // Open the continuation WITH its content (not a bare "…") so its push
-        // notification, if any, previews real text. Do it FIRST; on failure leave
-        // everything untouched.
-        let new_ev = match self.send_new(&render_streaming(&new_buf)).await {
-            Ok(ev) => ev,
-            Err(e) => {
-                tracing::warn!("reply-rollover: cannot open continuation message: {e:#}");
-                return false;
-            }
-        };
-        // Freeze the current message at the clean head (no cursor). Retried, but
-        // best-effort: a frozen message is never re-edited, so don't abort on it.
-        if let Err(e) = retry_finalize("reply-rollover", || self.edit(&head_final)).await {
-            tracing::warn!("reply-rollover: failed to finalize a rolled-over message: {e:#}");
-        }
-        self.event_id = Some(new_ev);
-        self.messages += 1;
-        self.buf = new_buf;
-        // The continuation was just sent with current content; next edit waits a
-        // full interval.
+    /// Replace the whole body and edit **immediately** (no throttle). Use on
+    /// stage boundaries so the user sees each milestone without waiting 700ms.
+    pub async fn set_now(&mut self, text: &str) -> Result<()> {
+        self.buf = text.to_string();
+        let rendered = render_streaming(&self.buf);
+        self.edit(&rendered).await?;
         self.last_edit = Instant::now();
-        true
+        self.pending = false;
+        Ok(())
     }
 
-    /// Send `body` as a fresh message and return its event id (a new live
-    /// message). Used to open a rollover continuation and the first message —
-    /// always with real content so it never notifies as a bare placeholder.
-    async fn send_new(&self, body: &str) -> Result<OwnedEventId> {
-        let resp = self
-            .room
-            .send(RoomMessageEventContent::text_markdown(body))
-            .await
-            .context("failed to open continuation message")?;
-        Ok(resp.response.event_id.clone())
-    }
-
-    /// A best-effort in-place edit: logs and swallows any send error so a
-    /// throttled streaming update can never abort the run producing the reply.
-    async fn edit_best_effort(&self, body: &str) {
-        if let Err(e) = self.edit(body).await {
-            tracing::warn!("reply-stream: dropped a best-effort streaming edit: {e:#}");
-        }
+    /// Finalize the reply. `final_text` (e.g. the authoritative full result)
+    /// replaces the accumulated buffer when given; otherwise the buffer is used.
+    /// The final edit drops the streaming cursor.
+    pub async fn finish(self, final_text: Option<&str>) -> Result<()> {
+        let text = final_text
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.buf.clone());
+        let text = if text.trim().is_empty() {
+            "(no output)".to_string()
+        } else {
+            truncate_bytes(&text, STREAM_MAX_BYTES)
+        };
+        // The complete reply must land. Unlike the throttled intermediate edits
+        // (best-effort, each superseded by the next), this final edit is the one
+        // the user is left with — retry until the homeserver acknowledges it.
+        retry_finalize("reply-finalize", || self.edit(&text)).await
     }
 
     async fn edit(&self, body: &str) -> Result<()> {
-        // Only valid once a live message exists; callers (throttled edit, rollover
-        // freeze, finish-with-event) ensure that. Defensive no-op otherwise.
-        let Some(event_id) = self.event_id.clone() else {
-            return Ok(());
-        };
         // Build the replacement directly rather than via Room::make_edit_event,
         // which fetches the target event from the server on every call (a
-        // round-trip per edit, and racy right after we send the message).
+        // round-trip per edit, and racy right after we send the placeholder).
         // We are the author and already hold the event id, so this is safe.
         let content = RoomMessageEventContent::text_markdown(body)
-            .make_replacement(ReplacementMetadata::new(event_id, None));
+            .make_replacement(ReplacementMetadata::new(self.event_id.clone(), None));
         self.room
             .send(content)
             .await
             .context("failed to send streaming edit")?;
-        Ok(())
-    }
-
-    /// Send `body` as a brand-new message (not an edit). Used for continuation
-    /// messages: a fresh `m.room.message` carries no `m.new_content` copy, so it
-    /// is far smaller on the wire than the equivalent edit.
-    async fn send_plain(&self, body: &str) -> Result<()> {
-        let content = RoomMessageEventContent::text_markdown(body);
-        self.room
-            .send(content)
-            .await
-            .context("failed to send continuation message")?;
         Ok(())
     }
 }
@@ -2007,140 +1769,12 @@ impl ReplyStream {
 /// Render an in-progress buffer: cap length, balance an odd ``` fence so a
 /// half-streamed code block doesn't swallow the rest, and append a cursor.
 fn render_streaming(buf: &str) -> String {
-    let mut s = truncate_bytes(buf, STREAM_ROLLOVER_BYTES);
+    let mut s = truncate_bytes(buf, STREAM_MAX_BYTES);
     if s.matches("```").count() % 2 == 1 {
         s.push_str("\n```");
     }
     s.push_str(" ▌");
     s
-}
-
-/// Split `text` into messages each ≤ `budget` bytes, cutting at the cleanest
-/// available boundary so a continuation never starts mid-sentence. This is what
-/// turns an arbitrarily long reply into a sequence of readable Matrix messages
-/// instead of one oversize event (`413 M_TOO_LARGE`).
-///
-/// Per chunk the boundary preference is: a paragraph break (`\n\n`), then a line
-/// break (`\n`), then a sentence end (`. ` / `! ` / `? `), then a word break
-/// (space), then a hard UTF-8-safe cut. An open ``` code fence is carried across
-/// the cut — closed at the end of one chunk and reopened at the start of the next
-/// — so a split code block renders cleanly on both sides.
-fn split_for_matrix(text: &str, budget: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    let mut reopen = false;
-    while !rest.is_empty() {
-        let prefix = if reopen { "```\n" } else { "" };
-        let avail = budget.saturating_sub(prefix.len()).max(1);
-        // Whole remainder fits → final chunk.
-        if rest.len() <= avail {
-            out.push(close_if_needed(&format!("{prefix}{rest}")));
-            return out;
-        }
-        // Safety valve: the last allowed message carries a truncated remainder.
-        if out.len() + 1 >= STREAM_MAX_MESSAGES {
-            let body = truncate_bytes(rest, avail);
-            out.push(close_if_needed(&format!("{prefix}{body}")));
-            return out;
-        }
-        let cut = pick_boundary(rest, avail);
-        let raw_head = &rest[..cut];
-        let head = match raw_head.trim_end() {
-            h if !h.is_empty() => h,
-            _ => raw_head,
-        };
-        let (piece, opened) = close_open_fence(&format!("{prefix}{head}"));
-        out.push(piece);
-        reopen = opened;
-        rest = rest[cut..].trim_start_matches('\n');
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
-}
-
-/// Pick the byte index in `s` at which to cut so the head is ≤ `avail` bytes and
-/// ends at the cleanest boundary available (see [`split_for_matrix`]). The
-/// returned index is always on a UTF-8 char boundary and ≥ 1, so callers make
-/// progress. Boundaries shorter than [`STREAM_MIN_SPLIT_BYTES`] are skipped in
-/// favour of a later (larger) boundary, except the final hard cut.
-fn pick_boundary(s: &str, avail: usize) -> usize {
-    let mut cap = s.len().min(avail);
-    while cap > 0 && !s.is_char_boundary(cap) {
-        cap -= 1;
-    }
-    if cap == 0 {
-        // Degenerate: advance one char so we never stall.
-        let mut e = 1;
-        while e < s.len() && !s.is_char_boundary(e) {
-            e += 1;
-        }
-        return e;
-    }
-    // Don't accept a boundary that would make the head smaller than half the
-    // window (avoids tiny messages), but never demand more than the configured
-    // minimum — so small budgets still honour word/sentence boundaries.
-    let floor = STREAM_MIN_SPLIT_BYTES.min(cap / 2).max(1);
-    let window = &s[..cap];
-    // 1. Paragraph break.
-    if let Some(p) = window.rfind("\n\n") {
-        let e = p + 2;
-        if e >= floor {
-            return e;
-        }
-    }
-    // 2. Single line break.
-    if let Some(p) = window.rfind('\n') {
-        let e = p + 1;
-        if e >= floor {
-            return e;
-        }
-    }
-    // 3. Sentence end.
-    if let Some(e) = last_sentence_end(window) {
-        if e >= floor {
-            return e;
-        }
-    }
-    // 4. Word break.
-    if let Some(p) = window.rfind(' ') {
-        let e = p + 1;
-        if e >= floor {
-            return e;
-        }
-    }
-    // 5. Hard cut at the largest char boundary ≤ avail.
-    cap
-}
-
-/// Largest index `e` such that `s[..e]` ends with a sentence terminator
-/// (`. `, `! `, `? `), or `None` if there is none.
-fn last_sentence_end(s: &str) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    for pat in [". ", "! ", "? "] {
-        if let Some(p) = s.rfind(pat) {
-            let e = p + pat.len();
-            best = Some(best.map_or(e, |b| b.max(e)));
-        }
-    }
-    best
-}
-
-/// If `s` has an odd number of ``` fences (i.e. ends inside a code block), append
-/// a closing fence. Returns the (possibly closed) string and whether it had to
-/// close one — the caller reopens the fence on the next chunk when so.
-fn close_open_fence(s: &str) -> (String, bool) {
-    if s.matches("```").count() % 2 == 1 {
-        (format!("{s}\n```"), true)
-    } else {
-        (s.to_string(), false)
-    }
-}
-
-/// [`close_open_fence`] keeping only the balanced string.
-fn close_if_needed(s: &str) -> String {
-    close_open_fence(s).0
 }
 
 /// Truncate `s` to at most `max_bytes`, on a UTF-8 char boundary.
@@ -2161,118 +1795,6 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use std::fs;
-
-    /// Strip whitespace and fence markers so we can assert no content was lost
-    /// across a split regardless of where boundaries fell.
-    fn words(s: &str) -> Vec<String> {
-        s.replace("```", " ")
-            .split_whitespace()
-            .map(str::to_string)
-            .collect()
-    }
-
-    #[test]
-    fn split_short_text_is_one_chunk() {
-        assert_eq!(split_for_matrix("hello world", 6_000), vec!["hello world"]);
-    }
-
-    #[test]
-    fn split_empty_text_is_one_empty_chunk() {
-        assert_eq!(split_for_matrix("", 6_000), vec![String::new()]);
-    }
-
-    #[test]
-    fn split_respects_budget_and_preserves_content() {
-        let text = "The quick brown fox jumps. ".repeat(1_000); // ~27 KB of sentences
-        let chunks = split_for_matrix(&text, 4_000);
-        assert!(chunks.len() >= 5, "expected several chunks, got {}", chunks.len());
-        for c in &chunks {
-            assert!(c.len() <= 4_000, "chunk of {} bytes exceeds budget", c.len());
-        }
-        // No words dropped or duplicated.
-        let rejoined: String = chunks.join(" ");
-        assert_eq!(words(&rejoined), words(&text));
-    }
-
-    #[test]
-    fn split_prefers_paragraph_boundary() {
-        let a = "A".repeat(3_500);
-        let b = "B".repeat(3_500);
-        let text = format!("{a}\n\n{b}");
-        let chunks = split_for_matrix(&text, 6_000);
-        assert_eq!(chunks.len(), 2);
-        assert!(chunks[0].starts_with('A') && chunks[0].ends_with('A'));
-        assert!(chunks[1].starts_with('B'));
-        // The paragraph break, not a mid-run cut, was used.
-        assert_eq!(chunks[0].len(), 3_500);
-    }
-
-    #[test]
-    fn split_never_cuts_mid_word_when_a_space_exists() {
-        // distinctive tokens so a mid-word cut would be detectable. Kept under
-        // the STREAM_MAX_MESSAGES flood guard at this budget (≈37 chunks).
-        let text = (0..2_000).map(|i| format!("tok{i:05} ")).collect::<String>();
-        let chunks = split_for_matrix(&text, 500);
-        assert!(chunks.len() > 1);
-        // Every token in the source survives intact in some chunk.
-        let rejoined: String = chunks.join(" ");
-        assert_eq!(words(&rejoined), words(&text));
-        // And no chunk ends with a partial token (would mean a mid-word cut).
-        for c in &chunks {
-            let tail = c.trim_end();
-            if let Some(last) = tail.split_whitespace().last() {
-                assert!(
-                    last.starts_with("tok") && last.len() == 8,
-                    "chunk ends with a partial token: {last:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn split_carries_code_fence_across_boundary() {
-        let body = "let x = 1;\n".repeat(800); // big code block forces a split inside it
-        let text = format!("intro paragraph\n\n```rust\n{body}```\nclosing remarks");
-        let chunks = split_for_matrix(&text, 3_000);
-        assert!(chunks.len() >= 2);
-        for c in &chunks {
-            assert_eq!(
-                c.matches("```").count() % 2,
-                0,
-                "chunk has an unbalanced code fence"
-            );
-        }
-    }
-
-    #[test]
-    fn split_hard_cuts_when_no_boundary_exists() {
-        let text = "x".repeat(10_000); // no whitespace at all
-        let chunks = split_for_matrix(&text, 2_000);
-        assert!(chunks.len() >= 5);
-        for c in &chunks {
-            assert!(c.len() <= 2_000);
-        }
-        assert_eq!(chunks.concat(), text);
-    }
-
-    #[test]
-    fn split_is_utf8_safe() {
-        let text = "héllo wörld ".repeat(500); // multi-byte chars near cut points
-        let chunks = split_for_matrix(&text, 300);
-        // Each chunk is valid UTF-8 by construction (String); assert content kept.
-        let rejoined: String = chunks.join(" ");
-        assert_eq!(words(&rejoined), words(&text));
-    }
-
-    #[test]
-    fn close_open_fence_balances_odd_fences() {
-        let (closed, opened) = close_open_fence("```rust\nlet x = 1;");
-        assert!(opened);
-        assert_eq!(closed.matches("```").count(), 2);
-        let (same, opened) = close_open_fence("no code here");
-        assert!(!opened);
-        assert_eq!(same, "no code here");
-    }
 
     #[test]
     fn avatar_mime_detects_by_magic_bytes() {

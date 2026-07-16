@@ -294,6 +294,70 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Pure builder for the pre-Olm `io.element.call.encryption_keys` JSON body.
+///
+/// Wire shape MUST match matrix-js-sdk `ToDeviceKeyTransport.sendKey` +
+/// `getValidEventContent` (Element Call / Element X / Element Web):
+///
+/// - `keys` is a **single object** `{ index, key }` — NOT an array. Element
+///   checks `content.keys.key` and drops arrays as "Malformed Event: Missing
+///   keys field" → grey empty tile + silence while we still decrypt *their*
+///   frames (asymmetric failure).
+/// - `member.id` = `${user}:${device}` (Element's receive fallback).
+/// - No top-level `device_id` / `membershipID` (Element does not send them).
+///
+/// Extracted so unit tests lock the production path (not a hand-copied fixture).
+pub fn build_call_encryption_keys_content(
+    room_id: &str,
+    own_user: &str,
+    device_id: &str,
+    key_index: u8,
+    key: &[u8],
+    sent_ts_ms: u64,
+) -> serde_json::Value {
+    let membership_id = format!("{own_user}:{device_id}");
+    serde_json::json!({
+        "keys": { "index": key_index, "key": base64_encode(key) },
+        "member": {
+            "claimed_device_id": device_id,
+            "id": membership_id,
+        },
+        "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
+        "room_id": room_id,
+        "sent_ts": sent_ts_ms,
+    })
+}
+
+/// Element-side validation of an encryption_keys payload (mirrors
+/// `ToDeviceKeyTransport.getValidEventContent`). Returns `Ok(())` only when
+/// Element would accept and install the key.
+pub fn element_call_accepts_encryption_keys(content: &serde_json::Value) -> Result<(), &'static str> {
+    let room_id = content.get("room_id").and_then(|v| v.as_str());
+    if room_id.map(|s| s.is_empty()).unwrap_or(true) {
+        return Err("no room_id");
+    }
+    let keys = content.get("keys").ok_or("missing keys")?;
+    if !keys.is_object() {
+        return Err("keys must be a single object (not array/null)");
+    }
+    if keys.get("key").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+        return Err("Missing keys field (keys.key)");
+    }
+    if keys.get("index").and_then(|v| v.as_u64()).is_none() {
+        return Err("Missing keys field (keys.index)");
+    }
+    let member = content.get("member").ok_or("missing member")?;
+    if member
+        .get("claimed_device_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.is_empty())
+        .unwrap_or(true)
+    {
+        return Err("Missing claimed_device_id");
+    }
+    Ok(())
+}
+
 /// Pull a string field out of a `serde_json::Value` object by key (None unless
 /// it's an object with that key holding a non-empty string).
 fn json_str(value: &serde_json::Value, key: &str) -> Option<String> {
@@ -392,37 +456,15 @@ impl AgentClient {
             .device_id()
             .ok_or_else(|| anyhow!("agent has no device_id; cannot send call encryption keys"))?;
 
-        // Wire shape MUST match matrix-js-sdk ToDeviceKeyTransport exactly
-        // (element-hq / matrix-org develop `ToDeviceKeyTransport.sendKey` +
-        // `getValidEventContent`):
-        //
-        //   keys: { index, key }          // SINGLE OBJECT — NOT an array
-        //   member: { claimed_device_id, id }
-        //   session: { application, call_id, scope }
-        //   room_id, sent_ts
-        //
-        // Element rejects anything where `!content.keys.key`:
-        //   "Malformed Event: Missing keys field"
-        // so an array payload is silently dropped → peer never installs our media
-        // key → grey empty tile + no audio (asymmetric: we still decrypt theirs).
-        //
-        // `member.id` is the per-session memberId. Element's receive path falls
-        // back to `${sender}:${claimed_device_id}` when absent; we send that
-        // same string so membership matching and hashed RTC identities stay
-        // consistent. Do NOT put top-level `device_id`/`membershipID` — Element
-        // does not send them and some validators treat unknown required-shape
-        // mismatches as soft-fail on older clients.
+        let content = build_call_encryption_keys_content(
+            room_id,
+            &own_user,
+            &device_id,
+            key_index,
+            key,
+            now_ms(),
+        );
         let membership_id = format!("{own_user}:{device_id}");
-        let content = serde_json::json!({
-            "keys": { "index": key_index, "key": base64_encode(key) },
-            "member": {
-                "claimed_device_id": device_id,
-                "id": membership_id,
-            },
-            "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
-            "room_id": room_id,
-            "sent_ts": now_ms(),
-        });
         tracing::info!(
             room_id,
             key_index,
@@ -778,36 +820,32 @@ mod tests {
         }
     }
 
-    /// The send side must emit `keys` as a SINGLE OBJECT (matrix-js-sdk
-    /// ToDeviceKeyTransport shape). Element's receiver checks
-    /// `content.keys.key` / `content.keys.index` and DROPS array payloads as
-    /// "Malformed Event: Missing keys field".
+    /// Production builder (`build_call_encryption_keys_content`) must emit the
+    /// matrix-js-sdk ToDeviceKeyTransport shape. Element drops array `keys` as
+    /// "Malformed Event: Missing keys field" → grey empty tile (2026-07-16).
     #[test]
     fn send_side_emits_keys_as_single_object_matching_element_call() {
         let (key_bytes, key_b64) = sample_key();
         let own_user = "@agent:matrix.inblock.io";
         let device_id = "ABCDEFGHIJ";
-
-        // Exactly the JSON the send path constructs.
+        let room = "!room:matrix.inblock.io";
         let membership_id = format!("{own_user}:{device_id}");
-        let content = json!({
-            "keys": { "index": 3, "key": base64_encode(&key_bytes) },
-            "member": { "claimed_device_id": device_id, "id": membership_id },
-            "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
-            "room_id": "!room:matrix.inblock.io",
-            "sent_ts": 1u64,
-        });
 
-        // Element Call validation: keys must be an object with .key and .index.
+        let content =
+            build_call_encryption_keys_content(room, own_user, device_id, 3, &key_bytes, 1);
+
+        assert!(
+            element_call_accepts_encryption_keys(&content).is_ok(),
+            "Element getValidEventContent must accept: {:?}",
+            element_call_accepts_encryption_keys(&content)
+        );
         assert!(content["keys"].is_object(), "send must emit keys as a single object");
-        assert!(content["keys"].is_array() == false);
+        assert!(!content["keys"].is_array());
         assert_eq!(content["keys"]["index"], 3);
         assert_eq!(content["keys"]["key"], key_b64);
-        // Simulate Element's getValidEventContent checks:
-        assert!(content["keys"]["key"].as_str().is_some());
-        assert!(content["keys"]["index"].as_u64().is_some());
         assert_eq!(content["member"]["claimed_device_id"], device_id);
         assert_eq!(content["member"]["id"], membership_id);
+        assert_eq!(content["room_id"], room);
         // Element ToDeviceKeyTransport does not put these top-level.
         assert!(content.get("device_id").is_none());
         assert!(content.get("membershipID").is_none());
@@ -818,6 +856,45 @@ mod tests {
         assert_eq!(parsed.keys.len(), 1);
         assert_eq!(parsed.keys[0].index, 3);
         assert_eq!(extract_sender_device_id(&parsed).as_deref(), Some(device_id));
+    }
+
+    /// Regression: array-shaped `keys` is what Element Call rejects (grey tile).
+    /// The production builder must never emit this; the validator must refuse it.
+    #[test]
+    fn element_call_rejects_array_keys_shape() {
+        let (key_bytes, key_b64) = sample_key();
+        let malformed = json!({
+            "keys": [ { "index": 0, "key": key_b64 } ],
+            "member": { "claimed_device_id": "DEV", "id": "@u:hs:DEV" },
+            "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
+            "room_id": "!r:hs",
+            "sent_ts": 1u64,
+        });
+        assert_eq!(
+            element_call_accepts_encryption_keys(&malformed),
+            Err("keys must be a single object (not array/null)")
+        );
+        // And the good builder never produces that.
+        let good = build_call_encryption_keys_content("!r:hs", "@u:hs", "DEV", 0, &key_bytes, 1);
+        assert!(element_call_accepts_encryption_keys(&good).is_ok());
+        assert!(good["keys"].is_object());
+    }
+
+    /// member.id must be user:device (LiveKit identity / Element fallback), not
+    /// bare mxid — hashed RTC identities and delayed-key membership matching
+    /// depend on consistent memberId.
+    #[test]
+    fn member_id_is_user_colon_device_not_bare_mxid() {
+        let (key_bytes, _) = sample_key();
+        let user = "@did-key-z6mkmwzijj2k3ckqvqnmmgvkefmhdse4zxrfvqksxdmgba4v:matrix.inblock.io";
+        let dev = "SIWX_4137b749";
+        let content =
+            build_call_encryption_keys_content("!bNDjt:matrix.inblock.io", user, dev, 0, &key_bytes, 42);
+        assert_eq!(
+            content["member"]["id"].as_str().unwrap(),
+            format!("{user}:{dev}")
+        );
+        assert_ne!(content["member"]["id"].as_str().unwrap(), user);
     }
 
     /// Device-id extraction fallbacks: member.device_id, membershipID parsing
