@@ -396,15 +396,22 @@ impl AgentClient {
             .ok_or_else(|| anyhow!("agent has no device_id; cannot send call encryption keys"))?;
 
         // Mirror Element X's verbatim `io.element.call.encryption_keys` wire shape
-        // (captured live from a real Element X client): `keys` is an ARRAY of
-        // `{index,key}`, and `member.claimed_device_id` carries the sending
-        // device — that, plus the to-device `sender`, is how the peer maps the key
-        // to our LiveKit identity `<user>:<device>`. (`member.id` is a per-session
-        // id on the Element X side; we send our user_id, which the receiver does
-        // not use for identity — `claimed_device_id` is the load-bearing field.)
+        // (captured live from a real Element X client):
+        //   - `keys` is an ARRAY of `{index,key}`
+        //   - `member.claimed_device_id` carries the sending device
+        //   - top-level `device_id` + `membershipID` ("<user>:<device>") are ALSO
+        //     set — Element Call's MatrixKeyProvider uses these to map the key onto
+        //     the LiveKit participant identity. Omitting them can leave the peer
+        //     unable to decrypt our published video/audio (grey "no stream" tile)
+        //     even while we correctly decrypt *their* frames.
+        // (`member.id` is a per-session id on Element X; we send our user_id as a
+        // stable stand-in — peers do not use it for identity.)
+        let membership_id = format!("{own_user}:{device_id}");
         let content = serde_json::json!({
             "keys": [ { "index": key_index, "key": base64_encode(key) } ],
             "member": { "claimed_device_id": device_id, "id": own_user },
+            "device_id": device_id,
+            "membershipID": membership_id,
             "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
             "room_id": room_id,
             "sent_ts": now_ms(),
@@ -766,10 +773,14 @@ mod tests {
         let device_id = "ABCDEFGHIJ";
 
         // Exactly the JSON the send path constructs — mirroring the verbatim
-        // Element X `io.element.call.encryption_keys` shape captured live.
+        // Element X `io.element.call.encryption_keys` shape captured live, plus
+        // top-level device_id/membershipID for LiveKit identity mapping.
+        let membership_id = format!("{own_user}:{device_id}");
         let content = json!({
             "keys": [ { "index": 3, "key": base64_encode(&key_bytes) } ],
             "member": { "claimed_device_id": device_id, "id": own_user },
+            "device_id": device_id,
+            "membershipID": membership_id,
             "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
             "room_id": "!room:matrix.inblock.io",
             "sent_ts": 1u64,
@@ -781,6 +792,8 @@ mod tests {
         assert_eq!(content["keys"][0]["index"], 3);
         assert_eq!(content["keys"][0]["key"], key_b64);
         assert_eq!(content["member"]["claimed_device_id"], device_id);
+        assert_eq!(content["device_id"], device_id);
+        assert_eq!(content["membershipID"], membership_id);
 
         // Our own permissive receiver still parses it back to one CallKey, and
         // extracts the device from member.claimed_device_id.
