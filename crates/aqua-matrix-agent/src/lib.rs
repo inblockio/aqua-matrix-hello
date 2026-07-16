@@ -1875,6 +1875,43 @@ impl ReplyStream {
         Ok(())
     }
 
+    /// Replace the whole body of the **current** message (does not append).
+    /// Throttled like [`push`]. Used for progress dashboards that rewrite
+    /// status in place (e.g. media-render % / ETA). Best-effort intermediates.
+    pub async fn set(&mut self, text: &str) -> Result<()> {
+        self.buf = text.to_string();
+        self.pending = true;
+        if self.event_id.is_none() {
+            if self.buf.len() >= FIRST_MESSAGE_MIN_BYTES {
+                self.send_first().await;
+            }
+            return Ok(());
+        }
+        if self.last_edit.elapsed() >= STREAM_EDIT_INTERVAL {
+            let rendered = render_streaming(&self.buf);
+            self.edit_best_effort(&rendered).await;
+            self.last_edit = Instant::now();
+            self.pending = false;
+        }
+        Ok(())
+    }
+
+    /// Replace the whole body and edit **immediately** (no throttle). Use on
+    /// stage boundaries so the user sees each milestone without waiting 700ms.
+    /// If no message exists yet, sends the first message now.
+    pub async fn set_now(&mut self, text: &str) -> Result<()> {
+        self.buf = text.to_string();
+        if self.event_id.is_none() {
+            self.send_first().await;
+            return Ok(());
+        }
+        let rendered = render_streaming(&self.buf);
+        self.edit_best_effort(&rendered).await;
+        self.last_edit = Instant::now();
+        self.pending = false;
+        Ok(())
+    }
+
     /// Finalize the reply across however many messages it spans. `final_text`
     /// (the authoritative full result) replaces the buffer **only when no
     /// rollover has happened** — once earlier messages are frozen, replacing the
