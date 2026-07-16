@@ -1707,6 +1707,31 @@ impl ReplyStream {
         Ok(())
     }
 
+    /// Replace the whole body (does not append). Throttled like [`push`].
+    /// Used for progress dashboards that rewrite status in place.
+    pub async fn set(&mut self, text: &str) -> Result<()> {
+        self.buf = text.to_string();
+        self.pending = true;
+        if self.last_edit.elapsed() >= STREAM_EDIT_INTERVAL {
+            let rendered = render_streaming(&self.buf);
+            self.edit(&rendered).await?;
+            self.last_edit = Instant::now();
+            self.pending = false;
+        }
+        Ok(())
+    }
+
+    /// Replace the whole body and edit **immediately** (no throttle). Use on
+    /// stage boundaries so the user sees each milestone without waiting 700ms.
+    pub async fn set_now(&mut self, text: &str) -> Result<()> {
+        self.buf = text.to_string();
+        let rendered = render_streaming(&self.buf);
+        self.edit(&rendered).await?;
+        self.last_edit = Instant::now();
+        self.pending = false;
+        Ok(())
+    }
+
     /// Finalize the reply. `final_text` (e.g. the authoritative full result)
     /// replaces the accumulated buffer when given; otherwise the buffer is used.
     /// The final edit drops the streaming cursor.
