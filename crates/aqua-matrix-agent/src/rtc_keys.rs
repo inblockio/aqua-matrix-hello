@@ -392,36 +392,45 @@ impl AgentClient {
             .device_id()
             .ok_or_else(|| anyhow!("agent has no device_id; cannot send call encryption keys"))?;
 
-        // Wire shape MUST match matrix-js-sdk ToDeviceKeyTransport (Element Call /
-        // Element X / Element Web). Verified against matrix-js-sdk develop
-        // `ToDeviceKeyTransport.sendKey` + `getValidEventContent`:
+        // Wire shape MUST match matrix-js-sdk ToDeviceKeyTransport exactly
+        // (element-hq / matrix-org develop `ToDeviceKeyTransport.sendKey` +
+        // `getValidEventContent`):
         //
         //   keys: { index, key }          // SINGLE OBJECT — NOT an array
         //   member: { claimed_device_id, id }
         //   session: { application, call_id, scope }
         //   room_id, sent_ts
         //
-        // Element's receiver rejects anything where `!content.keys.key`:
+        // Element rejects anything where `!content.keys.key`:
         //   "Malformed Event: Missing keys field"
         // so an array payload is silently dropped → peer never installs our media
-        // key → grey empty tile + no audio, while we still decrypt *their* frames
-        // (our receive path is deliberately lenient). That asymmetric failure is
-        // exactly the production symptom.
+        // key → grey empty tile + no audio (asymmetric: we still decrypt theirs).
         //
-        // `member.id` is Element's per-session memberId (UUID). We send a stable
-        // stand-in; identity mapping uses claimed_device_id + event sender.
-        // Top-level device_id/membershipID kept as defensive extras for older
-        // agent-to-agent parsers.
+        // `member.id` is the per-session memberId. Element's receive path falls
+        // back to `${sender}:${claimed_device_id}` when absent; we send that
+        // same string so membership matching and hashed RTC identities stay
+        // consistent. Do NOT put top-level `device_id`/`membershipID` — Element
+        // does not send them and some validators treat unknown required-shape
+        // mismatches as soft-fail on older clients.
         let membership_id = format!("{own_user}:{device_id}");
         let content = serde_json::json!({
             "keys": { "index": key_index, "key": base64_encode(key) },
-            "member": { "claimed_device_id": device_id, "id": own_user },
-            "device_id": device_id,
-            "membershipID": membership_id,
+            "member": {
+                "claimed_device_id": device_id,
+                "id": membership_id,
+            },
             "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
             "room_id": room_id,
             "sent_ts": now_ms(),
         });
+        tracing::info!(
+            room_id,
+            key_index,
+            claimed_device_id = %device_id,
+            member_id = %membership_id,
+            keys_is_object = content.get("keys").map(|k| k.is_object()).unwrap_or(false),
+            "TX io.element.call.encryption_keys wire shape (pre-Olm)"
+        );
 
         // Collect every device of every OTHER joined room member. `Device`s come
         // from the crypto store (populated by sync); we own them in `devices`
@@ -783,9 +792,7 @@ mod tests {
         let membership_id = format!("{own_user}:{device_id}");
         let content = json!({
             "keys": { "index": 3, "key": base64_encode(&key_bytes) },
-            "member": { "claimed_device_id": device_id, "id": own_user },
-            "device_id": device_id,
-            "membershipID": membership_id,
+            "member": { "claimed_device_id": device_id, "id": membership_id },
             "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
             "room_id": "!room:matrix.inblock.io",
             "sent_ts": 1u64,
@@ -800,8 +807,10 @@ mod tests {
         assert!(content["keys"]["key"].as_str().is_some());
         assert!(content["keys"]["index"].as_u64().is_some());
         assert_eq!(content["member"]["claimed_device_id"], device_id);
-        assert_eq!(content["device_id"], device_id);
-        assert_eq!(content["membershipID"], membership_id);
+        assert_eq!(content["member"]["id"], membership_id);
+        // Element ToDeviceKeyTransport does not put these top-level.
+        assert!(content.get("device_id").is_none());
+        assert!(content.get("membershipID").is_none());
 
         // Our own permissive receiver still parses it back to one CallKey.
         let parsed: CallEncryptionKeysEventContent =
