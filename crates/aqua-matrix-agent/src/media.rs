@@ -204,6 +204,39 @@ impl AgentClient {
             .await
     }
 
+    /// [`send_file`](Self::send_file) wrapped with a refresh-then-retry on
+    /// `M_UNKNOWN_TOKEN`, mirroring [`crate::AgentClient::send_dm_reliable_with_refresh`]
+    /// (see that method's doc comment for the full rationale). Unlike the DM
+    /// sends, `send_file` carries NO internal retry at all, so before this
+    /// wrapper a rejected attachment (e.g. a markdown-file delivery from
+    /// `MdBridge`) aborted straight to its plain-text fallback on the very
+    /// first error, with zero retry or reauth attempt. On `M_UNKNOWN_TOKEN`
+    /// specifically, reauth once and resend the same file once more.
+    pub async fn send_file_with_refresh(
+        &mut self,
+        target: &str,
+        path: impl AsRef<Path>,
+        caption: Option<&str>,
+    ) -> Result<String> {
+        let path = path.as_ref();
+        match self.send_file(target, path, caption).await {
+            Ok(id) => Ok(id),
+            Err(e) if crate::is_unknown_token(&e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "file send rejected with M_UNKNOWN_TOKEN; refreshing token and retrying once"
+                );
+                self.reauth_token_only()
+                    .await
+                    .context("token refresh after M_UNKNOWN_TOKEN failed")?;
+                self.send_file(target, path, caption)
+                    .await
+                    .context("file send still failed after token refresh")
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Send an image as `m.image`. Width/height are read from the header bytes
     /// (no full decode) so clients can lay the bubble out before downloading.
     /// Forces an `image/*` content-type so the homeserver records it as an image.

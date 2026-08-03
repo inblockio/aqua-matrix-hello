@@ -710,7 +710,12 @@ async fn acquire_session(
 /// True if `err`'s chain carries a Matrix `M_UNKNOWN_TOKEN` (the access token
 /// was rejected — expired or revoked). String-matched because `send_dm` wraps
 /// the typed matrix-sdk error in `anyhow` (same approach as `is_store_mismatch`).
-fn is_unknown_token(err: &anyhow::Error) -> bool {
+///
+/// `pub` so backend crates (e.g. `aqua-matrix-claude-p`, re-exported via
+/// `aqua-matrix-relay`) can classify a `ReplyStream::finish` failure the same
+/// way the `*_with_refresh` wrappers below do, instead of redefining this
+/// string match a second time.
+pub fn is_unknown_token(err: &anyhow::Error) -> bool {
     let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" | ");
     chain.contains("M_UNKNOWN_TOKEN")
         || chain.contains("UnknownToken")
@@ -1351,6 +1356,72 @@ impl AgentClient {
         Ok(last)
     }
 
+    /// [`send_dm_reliable`](Self::send_dm_reliable) wrapped with a
+    /// refresh-then-retry on `M_UNKNOWN_TOKEN`. Promotes the fix already proven
+    /// in the 2026-07-17 incident (`send_dm_reliable_with_refresh` in
+    /// `aqua-call-agent/src/bin/aqua_transcript_agent.rs`) into this shared
+    /// connector crate, so every backend gets it, not just one binary.
+    ///
+    /// `send_dm_reliable` already retries transient failures internally
+    /// (`retry_finalize`, several attempts with backoff), but all of those
+    /// attempts burn against the SAME access token — a dead/rotated credential
+    /// exhausts every attempt without ever refreshing it (the root cause: a
+    /// daemon builds one `AgentClient` per connection cycle, but a
+    /// long-running spawned task can hold a CLONE of it that outlives the
+    /// cycle, so nothing ever hands that clone a later cycle's fresh token).
+    /// On `M_UNKNOWN_TOKEN` specifically, reauth once
+    /// ([`reauth_token_only`](Self::reauth_token_only)) and run the full
+    /// reliable-send again: not a new backoff loop, just one reauth gating one
+    /// more pass through the existing one.
+    pub async fn send_dm_reliable_with_refresh(
+        &mut self,
+        target: &str,
+        message: &str,
+    ) -> Result<String> {
+        match self.send_dm_reliable(target, message).await {
+            Ok(id) => Ok(id),
+            Err(e) if is_unknown_token(&e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "DM send rejected with M_UNKNOWN_TOKEN; refreshing token and retrying once"
+                );
+                self.reauth_token_only()
+                    .await
+                    .context("token refresh after M_UNKNOWN_TOKEN failed")?;
+                self.send_dm_reliable(target, message)
+                    .await
+                    .context("DM send still failed after token refresh")
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`send_dm_chunked`](Self::send_dm_chunked) wrapped the same way as
+    /// [`send_dm_reliable_with_refresh`](Self::send_dm_reliable_with_refresh) —
+    /// see that method for the full rationale.
+    pub async fn send_dm_chunked_with_refresh(
+        &mut self,
+        target: &str,
+        message: &str,
+    ) -> Result<String> {
+        match self.send_dm_chunked(target, message).await {
+            Ok(id) => Ok(id),
+            Err(e) if is_unknown_token(&e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "chunked DM send rejected with M_UNKNOWN_TOKEN; refreshing token and retrying once"
+                );
+                self.reauth_token_only()
+                    .await
+                    .context("token refresh after M_UNKNOWN_TOKEN failed")?;
+                self.send_dm_chunked(target, message)
+                    .await
+                    .context("chunked DM send still failed after token refresh")
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Send a Markdown message into an **arbitrary already-joined room** (by room
     /// id), NOT a DM. The agent must already be a member of `room_id` (it is — it
     /// joined the owner's room to transcribe the call). Unlike [`send_dm`], this
@@ -1732,6 +1803,41 @@ where
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("{what}: transmission failed with no error recorded")))
+}
+
+/// Generic shape of the try -> (on `M_UNKNOWN_TOKEN`) reauth-once -> retry-once
+/// branching that every `*_with_refresh` method above implements directly
+/// against `self` (see [`AgentClient::send_dm_reliable_with_refresh`]).
+///
+/// This free function exists ONLY so that branching shape is unit-testable in
+/// isolation with injected fake errors: a real `AgentClient` needs a live
+/// matrix-sdk `Client` to construct, which a unit test can't do. The
+/// `*_with_refresh` methods do NOT call this helper — a method that built one
+/// closure borrowing `&self` (the op) and another borrowing `&mut self` (the
+/// reauth) would hold both borrows alive simultaneously as soon as they're
+/// passed to a shared call, which the borrow checker rejects. Each method
+/// instead writes the same shape directly as sequential statements against
+/// `self`, exactly mirroring what this helper proves correct: try once; on a
+/// token rejection, reauth once and retry once; any other error (or a reauth
+/// failure) propagates without a second attempt.
+#[cfg(test)]
+async fn reauth_then_retry<T, Op, OpFut, Reauth, ReauthFut>(mut op: Op, reauth: Reauth) -> Result<T>
+where
+    Op: FnMut() -> OpFut,
+    OpFut: std::future::Future<Output = Result<T>>,
+    Reauth: FnOnce() -> ReauthFut,
+    ReauthFut: std::future::Future<Output = Result<()>>,
+{
+    match op().await {
+        Ok(v) => Ok(v),
+        Err(e) if is_unknown_token(&e) => {
+            reauth()
+                .await
+                .context("token refresh after M_UNKNOWN_TOKEN failed")?;
+            op().await.context("still failed after token refresh")
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// RAII typing indicator, created by [`AgentClient::typing_guard`]. Refreshes
@@ -2487,5 +2593,111 @@ mod tests {
         assert!(loaded.oidc.redirect_uri.is_none());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- reauth_then_retry: the try -> reauth-once -> retry-once shape shared
+    // by every `*_with_refresh` method (see the doc comment on the helper for
+    // why these methods don't call it directly). ----
+
+    #[tokio::test]
+    async fn reauth_then_retry_reauths_once_on_unknown_token_then_succeeds() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let reauth_calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let c = calls.clone();
+        let rc = reauth_calls.clone();
+        let result: Result<&'static str> = reauth_then_retry(
+            move || {
+                let c = c.clone();
+                async move {
+                    c.set(c.get() + 1);
+                    if c.get() == 1 {
+                        // Simulated M_UNKNOWN_TOKEN, shaped like the real matrix-sdk
+                        // error string `is_unknown_token` matches against.
+                        Err(anyhow!(
+                            "the homeserver returned an error: M_UNKNOWN_TOKEN: Token is not active"
+                        ))
+                    } else {
+                        Ok("delivered")
+                    }
+                }
+            },
+            move || {
+                let rc = rc.clone();
+                async move {
+                    rc.set(rc.get() + 1);
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), "delivered");
+        assert_eq!(calls.get(), 2, "op must run exactly twice: the failing try + the post-reauth retry");
+        assert_eq!(reauth_calls.get(), 1, "reauth must run exactly once");
+    }
+
+    #[tokio::test]
+    async fn reauth_then_retry_does_not_reauth_on_a_different_error() {
+        // A non-token failure (e.g. a server 500) must propagate untouched — it
+        // must NOT be misclassified as an auth problem and must NOT trigger a
+        // reauth (which would mask the real fault and cost a token rotation for
+        // nothing).
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let reauth_calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let c = calls.clone();
+        let rc = reauth_calls.clone();
+        let result: Result<&'static str> = reauth_then_retry(
+            move || {
+                let c = c.clone();
+                async move {
+                    c.set(c.get() + 1);
+                    Err(anyhow!("the homeserver returned an error: M_UNKNOWN (status_code: 500)"))
+                }
+            },
+            move || {
+                let rc = rc.clone();
+                async move {
+                    rc.set(rc.get() + 1);
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(result.is_err(), "a non-token error must propagate");
+        assert!(
+            format!("{:#}", result.unwrap_err()).contains("M_UNKNOWN (status_code: 500)"),
+            "the original error must pass through unwrapped, not be masked as a token issue"
+        );
+        assert_eq!(calls.get(), 1, "op must run exactly once: no retry on a non-token error");
+        assert_eq!(reauth_calls.get(), 0, "a non-token error must never trigger a reauth");
+    }
+
+    #[tokio::test]
+    async fn reauth_then_retry_propagates_a_failed_reauth_without_retrying_op() {
+        // If the reauth itself fails (e.g. the refresh-grant call is down), that
+        // failure must propagate — and `op` must NOT be tried a second time
+        // against a token we just failed to refresh.
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let c = calls.clone();
+        let result: Result<&'static str> = reauth_then_retry(
+            move || {
+                let c = c.clone();
+                async move {
+                    c.set(c.get() + 1);
+                    Err(anyhow!(
+                        "the homeserver returned an error: M_UNKNOWN_TOKEN: Token is not active"
+                    ))
+                }
+            },
+            || async { Err(anyhow!("refresh-grant call failed: network unreachable")) },
+        )
+        .await;
+        assert!(result.is_err(), "a reauth failure must propagate");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("token refresh after M_UNKNOWN_TOKEN failed"),
+            "expected the reauth-failure context, got: {msg}"
+        );
+        assert!(msg.contains("network unreachable"), "expected the underlying cause, got: {msg}");
+        assert_eq!(calls.get(), 1, "op must not be retried when reauth itself fails");
     }
 }
