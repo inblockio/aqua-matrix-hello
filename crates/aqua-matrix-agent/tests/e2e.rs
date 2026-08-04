@@ -90,6 +90,17 @@ async fn sync_n(agent: &AgentClient, n: usize) {
     }
 }
 
+/// The Element Call `lk-jwt-service` `/sfu/get` endpoint to POST OpenID tokens to.
+/// Derived from the SAME Matrix base the agent connects through (`SIWX_E2E_MATRIX_URL`)
+/// so a LOCAL run hits the local caddy → lk-jwt route; falls back to the prod literal
+/// when the var is unset, preserving the existing prod-pointing behaviour.
+fn lk_jwt_endpoint() -> String {
+    match std::env::var("SIWX_E2E_MATRIX_URL") {
+        Ok(matrix_url) => format!("{}/livekit/jwt/sfu/get", matrix_url.trim_end_matches('/')),
+        Err(_) => "https://matrix.inblock.io/livekit/jwt/sfu/get".to_string(),
+    }
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -821,8 +832,15 @@ async fn rtc_room_alias_matches_element_call() {
 
     let _serial = E2E_LOCK.lock().await;
 
-    // The operator's real room, fixed so the alias is reproducible.
-    const ROOM_ID: &str = "!DkKJdSFKrQgAZACWKm:matrix.inblock.io";
+    // A fixed Matrix room id so the alias is reproducible. lk-jwt derives the
+    // LiveKit alias purely from the room-id STRING it is handed (it verifies the
+    // USER via the openid_token, not room membership — see rtc_jwt_handshake), so
+    // the id need not exist on the homeserver; any valid room-id string works.
+    // Parameterized so a LOCAL run can pin its own id; defaults to the operator's
+    // real prod room, preserving the existing prod-pointing behaviour.
+    let room_id: String = std::env::var("SIWX_E2E_RTC_ROOM")
+        .unwrap_or_else(|_| "!DkKJdSFKrQgAZACWKm:matrix.inblock.io".to_string());
+    let room_id = room_id.as_str();
 
     let agent = AgentClient::connect(agent_config("agent.pem"))
         .await
@@ -837,13 +855,13 @@ async fn rtc_room_alias_matches_element_call() {
 
     // EXACT body the call agent's fetch_livekit_token sends, with the REAL room id.
     let body = serde_json::json!({
-        "room": ROOM_ID,
+        "room": room_id,
         "openid_token": openid_token,
         "device_id": device_id,
     });
-    let endpoint = "https://matrix.inblock.io/livekit/jwt/sfu/get";
+    let endpoint = lk_jwt_endpoint();
     let resp = reqwest::Client::new()
-        .post(endpoint)
+        .post(&endpoint)
         .json(&body)
         .send()
         .await
@@ -870,10 +888,10 @@ async fn rtc_room_alias_matches_element_call() {
         .expect("no /video/room claim");
     let sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("");
 
-    let expected = expected_livekit_alias(ROOM_ID);
+    let expected = expected_livekit_alias(room_id);
 
     println!("\n=== ROOM ALIAS MAPPING PROOF ===");
-    println!("matrix room id        : {ROOM_ID}");
+    println!("matrix room id        : {room_id}");
     println!("SFU url                : {url}");
     println!("JWT sub (identity)     : {sub}");
     println!("JWT video.room (actual): {actual_room}");
@@ -891,7 +909,7 @@ async fn rtc_room_alias_matches_element_call() {
     );
     println!(
         "\nVERDICT: agent and Element Call land in the SAME LiveKit room ({actual_room}) \
-         for {ROOM_ID}."
+         for {room_id}."
     );
 }
 
@@ -984,10 +1002,10 @@ async fn rtc_jwt_handshake() {
         "openid_token": openid_token,
         "device_id": device_id,
     });
-    let endpoint = "https://matrix.inblock.io/livekit/jwt/sfu/get";
+    let endpoint = lk_jwt_endpoint();
     let http = reqwest::Client::new();
     let resp = http
-        .post(endpoint)
+        .post(&endpoint)
         .json(&body)
         .send()
         .await
