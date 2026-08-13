@@ -403,6 +403,27 @@ fn is_store_mismatch(err: &anyhow::Error) -> bool {
 }
 
 // TODO(aqua-security): seal/audit
+/// Extract Megolm `session_id` from encrypted timeline JSON, if present.
+/// Used by the UTD recovery path in [`AgentClient::messages`] so we can target a
+/// single-session key-backup download instead of always pulling the whole room.
+///
+/// Pure JSON helper so unit tests can lock the recovery contract without a live
+/// `TimelineEvent`.
+pub(crate) fn megolm_session_id_from_json(raw_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw_json).ok()?;
+    value
+        .get("content")
+        .and_then(|c| c.get("session_id"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_owned())
+}
+
+fn megolm_session_id_from_raw(
+    raw: &matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent>,
+) -> Option<String> {
+    megolm_session_id_from_json(raw.json().get())
+}
+
 fn wipe_crypto_store(store_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(store_dir) else { return };
     for entry in entries.flatten() {
@@ -1558,6 +1579,8 @@ impl AgentClient {
             .context("failed to fetch messages")?;
 
         let mut messages = Vec::new();
+        let mut utd_count: u32 = 0;
+        let mut utd_session_ids: Vec<String> = Vec::new();
         for event in resp.chunk {
             let Some(event_id) = event.event_id() else {
                 continue;
@@ -1570,6 +1593,15 @@ impl AgentClient {
             };
 
             if event.kind.is_utd() {
+                utd_count = utd_count.saturating_add(1);
+                // Best-effort session_id from the encrypted wire content so we
+                // can target a single-session backup download (matrix-sdk's
+                // decrypt path only queues a best-effort backup fetch).
+                if let Some(sid) = megolm_session_id_from_raw(event.raw()) {
+                    if !utd_session_ids.iter().any(|s| s == &sid) {
+                        utd_session_ids.push(sid);
+                    }
+                }
                 messages.push(Message {
                     sender: sender.to_string(),
                     body: "[unable to decrypt]".into(),
@@ -1599,6 +1631,63 @@ impl AgentClient {
                         timestamp_ms: u64::from(original.origin_server_ts.0),
                         event_id: original.event_id.to_string(),
                     });
+                }
+            }
+        }
+
+        // UTD recovery: pull missing megolm sessions from server-side key
+        // backup. Does not pause the caller — next poll may decrypt. Peers may
+        // also forward via automatic-room-key-forwarding on subsequent sync.
+        if utd_count > 0 {
+            tracing::warn!(
+                room_id = %room_id,
+                utd_count,
+                sessions = ?utd_session_ids,
+                "messages(): undecryptable event(s); requesting key-backup download"
+            );
+            if utd_session_ids.is_empty() {
+                if let Err(e) = self
+                    .client
+                    .encryption()
+                    .backups()
+                    .download_room_keys_for_room(room_id)
+                    .await
+                {
+                    tracing::warn!(
+                        room_id = %room_id,
+                        "messages(): room-wide key-backup download failed: {e:#}"
+                    );
+                } else {
+                    tracing::info!(
+                        room_id = %room_id,
+                        "messages(): room-wide key-backup download finished"
+                    );
+                }
+            } else {
+                for sid in &utd_session_ids {
+                    match self
+                        .client
+                        .encryption()
+                        .backups()
+                        .download_room_key(room_id, sid)
+                        .await
+                    {
+                        Ok(true) => tracing::info!(
+                            room_id = %room_id,
+                            session_id = %sid,
+                            "messages(): session key-backup download ok"
+                        ),
+                        Ok(false) => tracing::warn!(
+                            room_id = %room_id,
+                            session_id = %sid,
+                            "messages(): session key-backup download skipped (backup inactive?)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            room_id = %room_id,
+                            session_id = %sid,
+                            "messages(): session key-backup download failed: {e:#}"
+                        ),
+                    }
                 }
             }
         }
@@ -1883,6 +1972,44 @@ impl ReplyStream {
     /// instead. The text is split at clean boundaries into one edit of the
     /// current message plus any continuation messages, each retried until the
     /// homeserver acknowledges it (the final write is the one the user keeps).
+
+    /// Replace the whole body of the **current** message (does not append).
+    /// Throttled like [`push`]. Used for progress dashboards that rewrite
+    /// status in place (e.g. media-render % / ETA). Best-effort intermediates.
+    pub async fn set(&mut self, text: &str) -> Result<()> {
+        self.buf = text.to_string();
+        self.pending = true;
+        if self.event_id.is_none() {
+            if self.buf.len() >= FIRST_MESSAGE_MIN_BYTES {
+                self.send_first().await;
+            }
+            return Ok(());
+        }
+        if self.last_edit.elapsed() >= STREAM_EDIT_INTERVAL {
+            let rendered = render_streaming(&self.buf);
+            self.edit_best_effort(&rendered).await;
+            self.last_edit = Instant::now();
+            self.pending = false;
+        }
+        Ok(())
+    }
+
+    /// Replace the whole body and edit **immediately** (no throttle). Use on
+    /// stage boundaries so the user sees each milestone without waiting 700ms.
+    /// If no message exists yet, sends the first message now.
+    pub async fn set_now(&mut self, text: &str) -> Result<()> {
+        self.buf = text.to_string();
+        if self.event_id.is_none() {
+            self.send_first().await;
+            return Ok(());
+        }
+        let rendered = render_streaming(&self.buf);
+        self.edit_best_effort(&rendered).await;
+        self.last_edit = Instant::now();
+        self.pending = false;
+        Ok(())
+    }
+
     pub async fn finish(self, final_text: Option<&str>) -> Result<()> {
         let text = if self.messages <= 1 {
             final_text
@@ -2362,6 +2489,58 @@ mod tests {
         let (kept, dropped) = partition_dm_rooms(&original, &|_| false);
         assert_eq!(kept, vec![a, b], "first-seen order preserved, duplicate dropped");
         assert!(dropped.is_empty());
+    }
+
+    /// UTD recovery: session_id extraction from Megolm wire JSON (2026-07-16).
+    /// Without this, messages() cannot target key-backup download per session.
+    #[test]
+    fn megolm_session_id_from_encrypted_event_json() {
+        let raw = r#"{
+            "type": "m.room.encrypted",
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "sender_key": "curve25519:gUDDkdwmehNQniXLEbCuYearf2j+IfcSFUdQSktHNGY",
+                "session_id": "COAl/LHf66w8y/WuCCrLuL/glWitX9bS+LQMvq/vt8c",
+                "ciphertext": "deadbeef"
+            },
+            "event_id": "$evt1",
+            "sender": "@alice:example.org",
+            "origin_server_ts": 1
+        }"#;
+        assert_eq!(
+            megolm_session_id_from_json(raw).as_deref(),
+            Some("COAl/LHf66w8y/WuCCrLuL/glWitX9bS+LQMvq/vt8c")
+        );
+    }
+
+    #[test]
+    fn megolm_session_id_missing_on_cleartext() {
+        let raw = r#"{"type":"m.room.message","content":{"msgtype":"m.text","body":"hi"}}"#;
+        assert_eq!(megolm_session_id_from_json(raw), None);
+    }
+
+    #[test]
+    fn megolm_session_id_rejects_garbage() {
+        assert_eq!(megolm_session_id_from_json("not-json"), None);
+        assert_eq!(megolm_session_id_from_json("{}"), None);
+    }
+
+    /// Source-level contract: UTD path in messages() must request key-backup
+    /// download. Removing that block re-opens permanent room UTD after store loss.
+    #[test]
+    fn messages_utd_path_requests_key_backup_download() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("download_room_key")
+                && src.contains("undecryptable event(s); requesting key-backup download"),
+            "AgentClient::messages UTD recovery (key-backup download) must remain"
+        );
+        let recovery = include_str!("recovery.rs");
+        assert!(
+            recovery.contains("download_joined_room_keys")
+                && recovery.contains("download_room_keys_for_room"),
+            "cold-start SSSS restore must pull room keys from backup"
+        );
     }
 
     #[test]

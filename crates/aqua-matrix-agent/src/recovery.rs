@@ -67,9 +67,56 @@ pub(crate) async fn restore_if_needed(client: &Client, store_dir: &Path) {
     match client.encryption().recovery().recover(&key).await {
         Ok(()) => {
             tracing::info!("recovery restore succeeded; cross-signing secrets recovered from SSSS");
+            // SSSS gives us the megolm *backup decryption key*, not the room
+            // keys themselves. Pull historical inbound sessions from server-side
+            // key backup for every joined encrypted room so a post-wipe cold
+            // start can decrypt owner DM / control-channel history again.
+            download_joined_room_keys(client).await;
         }
         Err(e) => {
             tracing::warn!("recovery restore failed: {e:#}");
+        }
+    }
+}
+
+/// Best-effort: download megolm sessions from key backup for each joined
+/// room. Used after SSSS restore (and available to UTD recovery paths).
+/// Skips rooms whose encryption state is known-unencrypted; unknown/encrypted
+/// rooms are attempted (state may still be catching up after a wipe).
+pub(crate) async fn download_joined_room_keys(client: &Client) {
+    let rooms = client.joined_rooms();
+    if rooms.is_empty() {
+        return;
+    }
+    tracing::info!(
+        room_count = rooms.len(),
+        "attempting key-backup download for joined rooms"
+    );
+    for room in rooms {
+        // Skip rooms known to be cleartext; Unknown/Encrypted both get a try
+        // (Unknown is common right after a wipe before state is fully applied).
+        let state = room.encryption_state();
+        if !state.is_encrypted() && !state.is_unknown() {
+            continue;
+        }
+        match client
+            .encryption()
+            .backups()
+            .download_room_keys_for_room(room.room_id())
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    room_id = %room.room_id(),
+                    "key-backup download finished for room"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    room_id = %room.room_id(),
+                    "key-backup download failed: {e:#}"
+                );
+            }
         }
     }
 }
