@@ -66,8 +66,8 @@ use matrix_sdk::{
 // MediaHandle / MediaKind ride on [`InboundMedia`] so a handler can name an
 // attachment's kind and download it without touching matrix-sdk.
 pub use aqua_matrix_agent::{
-    load_dotenv, AgentClient, AgentConfig, MediaHandle, MediaKind, ReplyStream, TypingGuard,
-    WorkItem, WorkJournal, WorkState,
+    is_unknown_token, load_dotenv, AgentClient, AgentConfig, MediaHandle, MediaKind, ReplyStream,
+    TypingGuard, WorkItem, WorkJournal, WorkState,
 };
 pub use async_trait::async_trait;
 

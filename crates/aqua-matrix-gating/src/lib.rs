@@ -21,6 +21,17 @@
 //! hold its own per-target run lock to ensure at most one question is open per
 //! target at a time.
 
+// matrix-sdk 0.17's deeply-nested async/crypto types overflow rustc's default
+// recursion budget when THIS crate's own `tokio::spawn`s need to prove
+// `Send` for a future built from `aqua_matrix_agent::AgentClient` methods
+// (`md_bridge`'s accept-loop task, spawned from `MdBridge::setup`, is now one
+// of those since the reauth-on-401 fix added `reauth_token_only` calls behind
+// `send_dm_chunked_with_refresh`/`send_file_with_refresh`). Same fix, same
+// rationale, as the `#![recursion_limit = "256"]` already set in
+// `aqua-matrix-agent/src/lib.rs` — the limit is per-crate, so raising it there
+// does not cover the check rustc performs here.
+#![recursion_limit = "256"]
+
 pub mod destructive;
 mod ask_bridge;
 mod md_bridge;
