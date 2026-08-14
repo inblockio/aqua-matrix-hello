@@ -51,7 +51,17 @@ Edit the scripts **here in the repo**; the host symlinks pick the change up imme
 
 One command. Renders the config from the template, launches with the hardened podman flags, wires
 a systemd activity-watcher, and (`--onboard`) DMs the operator a forward-ready onboarding message
-carrying the agent's self-minted MXID for the peer to DM:
+carrying the agent's self-minted MXID.
+
+**The consultant initiates the connection.** The template sets `"initiate_dm": true`, so on first
+connect (when no DM room exists yet) the agent creates the room, invites the peer, and delivers
+her greeting into it — the peer just accepts the invite. The onboarding block therefore says
+"expect an invite from <MXID>", not "DM this MXID". Delivery is tracked by the greeted-marker:
+a failed initiate retries on the next process start. **Sequencing invariant:** `initiate_dm` in a
+config requires an image whose binary knows the field (`deny_unknown_fields` hard-rejects unknown
+keys) — roll the image BEFORE rendering configs that carry it; never point an old image at a
+freshly rendered config. (`--refresh-prompt` and `--keep-config` never inject the field into
+existing configs, so already-deployed consultants are unaffected until re-rendered.)
 
 ```bash
 bash ~/spawn-consultant.sh \

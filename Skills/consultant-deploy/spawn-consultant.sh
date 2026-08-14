@@ -7,7 +7,11 @@
 # the container with the SAME hardened podman flags as the original scripts (verbatim -
 # the security posture must not drift), wires the systemd activity-watcher, DMs Tim
 # "channel up", and (with --onboard) DMs Tim a ready-to-forward onboarding message that
-# carries the agent's self-minted MXID for the peer to DM.
+# carries the agent's self-minted MXID. Since the template sets "initiate_dm": true,
+# the consultant herself creates the DM room, invites the peer and delivers her
+# greeting (the peer just accepts the invite; no need to DM the MXID first).
+# SEQUENCING: a config carrying initiate_dm needs an image whose binary knows the
+# field (deny_unknown_fields) — never point an old image at a freshly rendered config.
 #
 # The relay firewall (crates/aqua-matrix-relay) gates BOTH message dispatch AND invite
 # auto-join on authorize(sender==target), so each instance only joins rooms the named
@@ -489,8 +493,9 @@ if [ "$ONBOARD" -eq 1 ]; then
 ----------
 Hi ${onboard_hi}! You've got your own dedicated Aqua Consultant. Her name is ${PERSONA}.
 
-To say hello, just send her a direct message on Matrix:
+She'll reach out to you herself: expect a Matrix chat invite from
   ${MXID}
+Just accept it and say hi; her greeting is already waiting for you.
 
 ${PERSONA} is a warm, read-only guide to everything Aqua: the protocol, the spec and Rust SDK, the wider ecosystem of projects around it, and the thinking and governance behind it, all grounded in the latest local Aqua sources. She'll greet you, get to know what you're after, and tailor everything to you. She only ever explains and cites; she never changes anything. Enjoy! 🌊
 ----------
@@ -503,8 +508,9 @@ EOF
 ----------
 Hi ${HUMAN_NAME}! You now have your own dedicated Aqua Consultant on Matrix.
 
-To start, send a direct message to:
+It will reach out to you itself: expect a chat invite from
   ${MXID}
+Just accept the invite; the greeting is already waiting in the room.
 
 It's a read-only assistant that answers questions about the Aqua protocol, spec, and Rust SDK, plus the repository ecosystem around them and the governance principles behind them, grounded in the latest local Aqua sources. On first contact it'll greet you and ask a couple of quick questions (your name, background, what brings you to Aqua, and how deep you want to go), then tailor everything to you. It only explains and cites; it never modifies anything.
 ----------

@@ -138,11 +138,26 @@ impl AgentClient {
     pub(crate) async fn ensure_dm_room(&self, target: &UserId) -> Result<matrix_sdk::Room> {
         let room = match self.find_dm_room(target).await {
             Some(room) => room,
-            None => self
-                .client()
-                .create_dm(target)
-                .await
-                .context("create_dm failed")?,
+            None => {
+                let room = self
+                    .client()
+                    .create_dm(target)
+                    .await
+                    .context("create_dm failed")?;
+                // A freshly created DM must match the fleet's E2EE posture even
+                // when the homeserver does not force encryption for the DM
+                // preset: enable it explicitly. Best-effort — a failure leaves
+                // an unencrypted-but-functional room rather than no room.
+                match room.latest_encryption_state().await {
+                    Ok(state) if state.is_encrypted() => {}
+                    _ => {
+                        if let Err(e) = room.enable_encryption().await {
+                            tracing::warn!("failed to enable encryption on fresh DM: {e:#}");
+                        }
+                    }
+                }
+                room
+            }
         };
         let already_marked = self
             .client()

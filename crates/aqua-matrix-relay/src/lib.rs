@@ -226,6 +226,20 @@ pub trait MessageHandler: Send + Sync + 'static {
     /// delivery that did not actually land. Default: no-op.
     fn hello_delivered(&self) {}
 
+    /// Whether the agent should INITIATE the DM when no shared room with
+    /// `target` exists yet: create the room, invite the peer, and deliver the
+    /// `hello` into it, instead of deferring until the peer DMs first.
+    ///
+    /// Default `false` keeps the long-standing guard: against a programmatic
+    /// peer that also creates rooms, both sides `create_dm` and split into two
+    /// rooms, breaking Megolm key exchange. Opt in only when the peer is a
+    /// human who is NOT expected to DM first (e.g. a freshly deployed
+    /// consultant whose served person should simply receive the invite and
+    /// greeting).
+    fn initiates_dm(&self) -> bool {
+        false
+    }
+
     /// Periodic tick interval. `None` (the default) disables the timer; the
     /// daemon then only reacts to inbound messages.
     fn tick_interval(&self) -> Option<Duration> {
@@ -584,6 +598,26 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
                             // Greeting confirmed delivered: let the handler commit
                             // any "already greeted" state now, not on a failed send.
                             handler.hello_delivered();
+                        }
+                    }
+                    _ if handler.initiates_dm() => {
+                        // Opt-in (human peer that never DMs first): initiate the
+                        // connection ourselves. `send_dm` resolves-or-creates the
+                        // DM room (create_dm + m.direct mark, see ensure_dm_room),
+                        // so this one call creates the room, invites the peer and
+                        // delivers the greeting into it. On failure the greeted
+                        // marker is not committed, so the next process start
+                        // retries exactly like the deferred path.
+                        tracing::info!(
+                            "{}: no DM room yet; initiating DM (create room + invite peer)",
+                            handler.role()
+                        );
+                        match agent.send_dm(&target, &hello).await {
+                            Ok(_) => handler.hello_delivered(),
+                            Err(e) => tracing::warn!(
+                                "{}: initiate-DM hello failed (retries next process start): {e:#}",
+                                handler.role()
+                            ),
                         }
                     }
                     _ => tracing::info!(
