@@ -93,7 +93,7 @@ PERSONA_HELPER="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/consultant-perso
 # Grounding repos, mounted ro at /refs/<name>. This ONE list drives the presence check,
 # the freshness pass, and the podman -v flags, so the three can never drift apart.
 # Keep it in sync with ref_mounts in consultant-config.template.json.
-REFS_REPOS=(aqua-rs-sdk aqua-spec aqua-governance-corpus aqua-ecosystem aqua-compliance)
+REFS_REPOS=(aqua-rs-sdk aqua-spec aqua-governance-corpus aqua-ecosystem aqua-compliance inblockio.github.io)
 
 # Print the leading comment block (line 2 through the line before `set -euo pipefail`),
 # so this stays correct as the header grows.

@@ -9,10 +9,12 @@ Deploy and maintain **dedicated, single-target Aqua consultants** — one contai
 running `localhost/aqua-matrix-agent:poc` (the `aqua-matrix-claude-p` backend), bound to exactly
 ONE peer MXID by the relay firewall (`authorize(sender == target)` in
 [`crates/aqua-matrix-relay`](../../crates/aqua-matrix-relay/src/lib.rs)). Each consultant is a
-read-only Aqua-protocol assistant grounded in four repos mounted read-only at `/refs`:
+read-only Aqua-protocol assistant grounded in six repos mounted read-only at `/refs`:
 `aqua-rs-sdk` (reference implementation), `aqua-spec` (authoritative spec),
-`aqua-ecosystem` (trust-layer map: tiers, products, per-repo registry facts), and
-`aqua-governance-corpus` (governance principles, ICT kernels, deliberation methods).
+`aqua-ecosystem` (trust-layer map: tiers, products, per-repo registry facts),
+`aqua-governance-corpus` (governance principles, ICT kernels, deliberation methods),
+`aqua-compliance` (regulatory positioning across jurisdictions), and
+`inblockio.github.io` (the published inblock.io website: products, positioning, team).
 The system prompt in `consultant-config.template.json` tells the agent how to use each.
 
 This skill replaces the old approach of hand-cloning a `recreate-<label>-consultant.sh` per peer.
@@ -42,7 +44,8 @@ Edit the scripts **here in the repo**; the host symlinks pick the change up imme
 
 - Image built: `bash ~/aqua-agents/scripts/build-image.sh` (stages the 4 sibling repos + host `claude`, retags `:poc`).
 - Refs checkouts on the host: `~/aqua-rs-sdk`, `~/aqua-spec`, `~/aqua-governance-corpus`,
-  `~/aqua-ecosystem` (all under `github.com/inblockio/`). The spawner mounts them ro at
+  `~/aqua-ecosystem`, `~/aqua-compliance`, `~/inblockio.github.io` (all under
+  `github.com/inblockio/`). The spawner mounts them ro at
   `/refs/<name>` and **refuses to launch if one is missing** (it prints the exact clone command).
 - OAuth token at `~/.aqua-matrix-heartbeat/claude-oauth-token` (passed **by reference** — never on a command line).
 - `~/.aqua-matrix-notify/notify-tim.sh` (operator DMs) and `target/debug/aqua-activity-watch` (built) for the watcher.
