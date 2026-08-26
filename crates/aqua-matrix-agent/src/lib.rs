@@ -175,6 +175,20 @@ pub struct Message {
     pub body: String,
     pub timestamp_ms: u64,
     pub event_id: String,
+    /// MXID list from the event's `m.mentions.user_ids` (MSC3952). Empty when
+    /// the client omitted intentional mentions or the event is undecryptable.
+    /// This is the protocol signal that the sender @-addressed those users;
+    /// plaintext `body` may only show a display name.
+    pub mentioned_user_ids: Vec<String>,
+}
+
+impl Message {
+    /// Whether `m.mentions` names `mxid` (case-insensitive).
+    pub fn mentions_user(&self, mxid: &str) -> bool {
+        self.mentioned_user_ids
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(mxid))
+    }
 }
 
 #[derive(Clone)]
@@ -1678,6 +1692,7 @@ impl AgentClient {
                     body: "[unable to decrypt]".into(),
                     timestamp_ms: u64::from(timestamp.0),
                     event_id: event_id.to_string(),
+                    mentioned_user_ids: Vec::new(),
                 });
                 continue;
             }
@@ -1696,11 +1711,18 @@ impl AgentClient {
                         MessageType::Emote(emote) => emote.body.clone(),
                         _ => continue,
                     };
+                    let mentioned_user_ids = original
+                        .content
+                        .mentions
+                        .as_ref()
+                        .map(|m| m.user_ids.iter().map(|u| u.to_string()).collect())
+                        .unwrap_or_default();
                     messages.push(Message {
                         sender: original.sender.to_string(),
                         body,
                         timestamp_ms: u64::from(original.origin_server_ts.0),
                         event_id: original.event_id.to_string(),
+                        mentioned_user_ids,
                     });
                 }
             }
