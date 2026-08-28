@@ -1765,6 +1765,24 @@ impl AgentClient {
             .ok_or_else(|| anyhow!("no DM room with {target} for a streaming reply"))?;
         ReplyStream::start(room).await
     }
+
+    /// [`reply_stream`](Self::reply_stream) bound to an explicit joined room
+    /// instead of a peer's DM — the streaming analogue of
+    /// [`send_to_room`](Self::send_to_room).
+    ///
+    /// Same edit-in-place semantics: one message is rewritten via `m.replace` as
+    /// the caller pushes, so a multi-stage progress report costs one visible
+    /// message rather than one per stage. Use it when the audience is a room
+    /// (a call's participants) rather than a single person.
+    pub async fn reply_stream_in_room(&self, room_id: &str) -> Result<ReplyStream> {
+        let room_id: &RoomId =
+            room_id.try_into().map_err(|e| anyhow!("invalid room_id: {e}"))?;
+        let room = self
+            .client
+            .get_room(room_id)
+            .ok_or_else(|| anyhow!("room {room_id} not found for a streaming reply"))?;
+        ReplyStream::start(room).await
+    }
 }
 
 /// How often to push an in-place edit while streaming. Editing per token would
