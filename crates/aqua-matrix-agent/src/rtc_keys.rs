@@ -357,33 +357,40 @@ fn extract_sender_device_id(content: &CallEncryptionKeysEventContent) -> Option<
 // AgentClient API: send + receive
 // ---------------------------------------------------------------------------
 
+/// Build the `io.element.call.encryption_keys` content.
+///
+/// `keys` is a **SINGLE OBJECT**, not an array. Element's `ToDeviceKeyTransport`
+/// parses this field as one `{index, key}`; handed an array it rejects the whole
+/// event as `Malformed Event: Missing keys field`, never installs our key, marks
+/// our participant's index 0 invalid and skips decryption — which renders the
+/// agent's tile BLACK for the entire call while the agent happily publishes
+/// frames nobody can decode. Confirmed from an Element console 2026-08-31.
+///
+/// Our own receiver ([`deserialize_keys`]) is lenient and accepts the array, the
+/// object and an index→key map, which is why agent-to-agent calls never surfaced
+/// this and why the send side could drift unnoticed.
+///
+/// `member.claimed_device_id` carries the sending device — that, plus the
+/// to-device `sender`, is how the peer maps the key to our LiveKit identity
+/// `<user>:<device>`. (`member.id` is a per-session id on the Element X side; we
+/// send our user_id, which the receiver does not use for identity.)
+fn build_encryption_keys_content(
+    room_id: &str,
+    key_index: u8,
+    key: &[u8],
+    device_id: &str,
+    own_user: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "keys": { "index": key_index, "key": base64_encode(key) },
+        "member": { "claimed_device_id": device_id, "id": own_user },
+        "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
+        "room_id": room_id,
+        "sent_ts": now_ms(),
+    })
+}
+
 impl AgentClient {
-    /// Olm-encrypt and send this agent's media key for `room_id` to **every
-    /// device of every other member** of the room — the Element Call key-share.
-    ///
-    /// `key_index` is the key-ring slot (Element Call ratchets `(i+1) % 256`);
-    /// `key` is the raw 16 AES key bytes (base64-encoded here for the wire).
-    ///
-    /// **Wire shape mirrors Element X.** `keys` is emitted as a SINGLE OBJECT
-    /// `{"index":N,"key":"b64"}` (not an array) to match Element X's
-    /// `ToDeviceKeyTransport`, whose receiver likely expects the same. Device
-    /// identification is provided the way Element X does it: the top-level
-    /// `device_id` and `membershipID` (`"<user>:<device>"`) are set so a peer can
-    /// map our key to our LiveKit identity `<user_id>:<device_id>`, in addition to
-    /// the legacy `member.id` / `member.claimed_device_id` (kept for
-    /// agent-to-agent). `session` is the room-scoped `m.call` default; `sent_ts`
-    /// is now. (Our own permissive receiver accepts both the array and
-    /// single-object shapes, so agent-to-agent is unaffected.)
-    ///
-    /// Recipients are collected as all devices of all joined room members
-    /// *except this agent's own user id*. Sent with
-    /// [`CollectStrategy::AllDevices`] so it reaches **unverified** Element X
-    /// devices too (we never cross-sign-verify a human's device, so a
-    /// verification-gated strategy would silently withhold the key and break
-    /// media). Returns `Ok(())` even if `encrypt_and_send_raw_to_device`
-    /// reports per-device failures (logged) — a single unreachable device must
-    /// not abort the whole share; it errors only if the content can't be built
-    /// or no recipient devices exist.
     pub async fn send_call_encryption_keys(
         &self,
         room_id: &str,
@@ -395,20 +402,7 @@ impl AgentClient {
             .device_id()
             .ok_or_else(|| anyhow!("agent has no device_id; cannot send call encryption keys"))?;
 
-        // Mirror Element X's verbatim `io.element.call.encryption_keys` wire shape
-        // (captured live from a real Element X client): `keys` is an ARRAY of
-        // `{index,key}`, and `member.claimed_device_id` carries the sending
-        // device — that, plus the to-device `sender`, is how the peer maps the key
-        // to our LiveKit identity `<user>:<device>`. (`member.id` is a per-session
-        // id on the Element X side; we send our user_id, which the receiver does
-        // not use for identity — `claimed_device_id` is the load-bearing field.)
-        let content = serde_json::json!({
-            "keys": [ { "index": key_index, "key": base64_encode(key) } ],
-            "member": { "claimed_device_id": device_id, "id": own_user },
-            "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
-            "room_id": room_id,
-            "sent_ts": now_ms(),
-        });
+        let content = build_encryption_keys_content(room_id, key_index, key, &device_id, &own_user);
 
         // Collect every device of every OTHER joined room member. `Device`s come
         // from the crypto store (populated by sync); we own them in `devices`
@@ -756,34 +750,45 @@ mod tests {
         }
     }
 
-    /// The send side must emit `keys` as a SINGLE OBJECT (Element X's shape),
-    /// plus Element-X-style device identification (`device_id` + `membershipID`).
-    /// This mirrors the JSON `send_call_encryption_keys` builds.
+    /// The send side must emit `keys` as a SINGLE OBJECT — Element's
+    /// `ToDeviceKeyTransport` shape.
+    ///
+    /// Regression, found from an Element console 2026-08-31: we emitted an
+    /// ARRAY, Element rejected the event as `Malformed Event: Missing keys
+    /// field`, never installed our key, marked our participant's index 0
+    /// invalid and skipped decryption — the agent's tile was BLACK for the whole
+    /// call while it happily published frames nobody could decode.
+    ///
+    /// The previous version of this test built its own `json!` literal and
+    /// asserted against that copy, so it passed while the production payload was
+    /// the opposite shape (its own doc comment already said "SINGLE OBJECT"
+    /// while its assertion demanded an array). It now calls the real builder —
+    /// a mirror of the payload can only ever test itself.
     #[test]
-    fn send_side_emits_keys_as_array_matching_element_x() {
+    fn send_side_emits_keys_as_a_single_object_for_element() {
         let (key_bytes, key_b64) = sample_key();
         let own_user = "@agent:matrix.inblock.io";
         let device_id = "ABCDEFGHIJ";
 
-        // Exactly the JSON the send path constructs — mirroring the verbatim
-        // Element X `io.element.call.encryption_keys` shape captured live.
-        let content = json!({
-            "keys": [ { "index": 3, "key": base64_encode(&key_bytes) } ],
-            "member": { "claimed_device_id": device_id, "id": own_user },
-            "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
-            "room_id": "!room:matrix.inblock.io",
-            "sent_ts": 1u64,
-        });
+        let content = build_encryption_keys_content(
+            "!room:matrix.inblock.io",
+            3,
+            &key_bytes,
+            device_id,
+            own_user,
+        );
 
-        // `keys` is an ARRAY (Element X's shape), and member.claimed_device_id
-        // carries the sending device.
-        assert!(content["keys"].is_array(), "send must emit keys as an array (Element X shape)");
-        assert_eq!(content["keys"][0]["index"], 3);
-        assert_eq!(content["keys"][0]["key"], key_b64);
+        assert!(
+            content["keys"].is_object(),
+            "keys must be a single object; an array is rejected by Element's \
+             ToDeviceKeyTransport as a malformed event: {content}"
+        );
+        assert!(!content["keys"].is_array(), "keys must NOT be an array: {content}");
+        assert_eq!(content["keys"]["index"], 3);
+        assert_eq!(content["keys"]["key"], key_b64);
         assert_eq!(content["member"]["claimed_device_id"], device_id);
 
-        // Our own permissive receiver still parses it back to one CallKey, and
-        // extracts the device from member.claimed_device_id.
+        // Our own permissive receiver still round-trips what we now send.
         let parsed: CallEncryptionKeysEventContent =
             serde_json::from_value(content).expect("our receiver accepts our own send shape");
         assert_eq!(parsed.keys.len(), 1);
