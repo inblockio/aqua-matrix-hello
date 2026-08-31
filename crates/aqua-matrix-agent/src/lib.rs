@@ -31,7 +31,7 @@ use matrix_sdk::{
         },
         OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId,
     },
-    Client, SessionMeta, SessionTokens,
+    Client, RoomMemberships, SessionMeta, SessionTokens,
 };
 use serde::{Deserialize, Serialize};
 use siwx_oidc_auth::SiwxKey;
@@ -788,6 +788,38 @@ fn partition_dm_rooms(
     (kept, dropped)
 }
 
+/// How many users have `join` membership in `room`, counted from the STATE STORE
+/// rather than from the room summary.
+///
+/// WHY NOT `Room::joined_members_count()`: that getter returns only
+/// `summary.joined_member_count` — the homeserver's `m.heroes`/counts block,
+/// which the spec has the server send for rooms the client must NAME itself
+/// (no `m.room.name` / canonical alias). For a NAMED room Synapse omits the
+/// block entirely, matrix-sdk never backfills it from the member events it
+/// nonetheless stores, and the getter answers a flat `0`.
+///
+/// That made every `> 2` group-room guard silently vacuous on named rooms
+/// (`0 > 2` is false), so [`find_dm_room`](AgentClient::find_dm_room) accepted
+/// arbitrary group rooms as the target's "DM" and delivery landed wherever the
+/// activity tie-break pointed. Counting `RoomMemberships::JOIN` out of the store
+/// is authoritative for any room the client has synced membership for.
+///
+/// Falls back to the summary count if the store read fails, so a store error
+/// degrades to the old behavior instead of treating a group room as a 1:1.
+async fn joined_member_count(room: &matrix_sdk::Room) -> u64 {
+    match room.members(RoomMemberships::JOIN).await {
+        Ok(members) => members.len() as u64,
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                room_id = %room.room_id(),
+                "joined-member count: store read failed; falling back to the room summary count"
+            );
+            room.joined_members_count()
+        }
+    }
+}
+
 /// Best-effort: after a store-wipe re-bootstrap minted a NEW device_id, delete the
 /// agent's OTHER server-side devices, so peers stop encrypting to dead devices
 /// whose Megolm keys this device can never read. Under MSC3861/OIDC delegated auth
@@ -843,7 +875,7 @@ impl AgentClient {
         // (room, rank): rank 2 = target Join, 1 = target Invite. Leave/Ban/Knock excluded.
         let mut candidates: Vec<(matrix_sdk::Room, u8)> = Vec::new();
         for room in self.client.joined_rooms() {
-            if room.joined_members_count() > 2 {
+            if joined_member_count(&room).await > 2 {
                 continue; // group room, not a 1:1 DM
             }
             let Some(member) = room.get_member(target).await.ok().flatten() else {
@@ -1733,6 +1765,24 @@ impl AgentClient {
             .ok_or_else(|| anyhow!("no DM room with {target} for a streaming reply"))?;
         ReplyStream::start(room).await
     }
+
+    /// [`reply_stream`](Self::reply_stream) bound to an explicit joined room
+    /// instead of a peer's DM — the streaming analogue of
+    /// [`send_to_room`](Self::send_to_room).
+    ///
+    /// Same edit-in-place semantics: one message is rewritten via `m.replace` as
+    /// the caller pushes, so a multi-stage progress report costs one visible
+    /// message rather than one per stage. Use it when the audience is a room
+    /// (a call's participants) rather than a single person.
+    pub async fn reply_stream_in_room(&self, room_id: &str) -> Result<ReplyStream> {
+        let room_id: &RoomId =
+            room_id.try_into().map_err(|e| anyhow!("invalid room_id: {e}"))?;
+        let room = self
+            .client
+            .get_room(room_id)
+            .ok_or_else(|| anyhow!("room {room_id} not found for a streaming reply"))?;
+        ReplyStream::start(room).await
+    }
 }
 
 /// How often to push an in-place edit while streaming. Editing per token would
@@ -2326,6 +2376,32 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Guard for the 2026-08-28 mis-delivery: `find_dm_room`'s group-room filter
+    /// must size rooms from the STATE STORE, never from `Room`'s summary-only
+    /// getter. The homeserver omits the summary block for any room that has a
+    /// name, so that getter answers `0` there, `0 > 2` is false, and the filter
+    /// silently stops excluding group rooms — which is how a 4-person room was
+    /// selected as the owner's "DM" and received a call summary.
+    ///
+    /// Asserted on the extracted function body (sliced to the next item) so the
+    /// test's own literals can never satisfy the search.
+    #[test]
+    fn find_dm_room_does_not_size_rooms_from_the_room_summary() {
+        let src = include_str!("lib.rs");
+        let start = src.find("async fn find_dm_room").expect("find_dm_room must exist");
+        let rest = &src[start..];
+        let end = rest.find("pub async fn connect").expect("find_dm_room precedes connect");
+        let body = &rest[..end];
+        assert!(
+            body.contains("joined_member_count(&room).await > 2"),
+            "the group-room filter must use the store-backed count helper"
+        );
+        assert!(
+            !body.contains(".joined_members_count()"),
+            "find_dm_room must not size rooms from the summary-only getter"
+        );
+    }
 
     /// Strip whitespace and fence markers so we can assert no content was lost
     /// across a split regardless of where boundaries fell.
