@@ -23,40 +23,40 @@
 //! call backend feeds the received keys into its LiveKit `KeyProvider` and hands
 //! its own generated keys here to publish.
 //!
-//! ## Wire format (TWO shapes, both accepted on receive)
+//! ## Wire format
 //!
-//! Event type: `io.element.call.encryption_keys`. The decrypted to-device
-//! content's `keys` field is **NOT** the same shape on every transport:
+//! Event type: `io.element.call.encryption_keys`. **Send** uses a single
+//! `keys` object (`{index,key}`) matching matrix-js-sdk `ToDeviceKeyTransport`
+//! (`build_call_encryption_keys_content`). **Receive** is lenient — three
+//! shapes, all normalised to `Vec<CallKey>`:
 //!
-//! * matrix-js-sdk / agent-to-agent (legacy here) sends an **array**:
+//! * array (legacy / some peers):
 //!   ```json
 //!   { "keys": [ { "index": <u8>, "key": "<base64>" } ], "member": {...}, ... }
 //!   ```
-//! * Element X's `ToDeviceKeyTransport` sends `keys` as a **single object**
-//!   (live failure: `invalid type: map, expected a sequence`):
+//! * single object (Element Call / Element X):
 //!   ```json
 //!   { "keys": { "index": <u8>, "key": "<base64>" }, ... }
 //!   ```
-//!   and an index→key **map** (`{ "0": "<base64>" }`) is also tolerated.
+//! * index→key map (`{ "0": "<base64>" }`).
 //!
 //! The lenient [`deserialize_keys`] below accepts all three and normalises to
 //! `Vec<CallKey>`. The exact verbatim Element X content shape (the `member` /
 //! `session` / any extra top-level fields) is **still unconfirmed** — it failed
-//! to deserialize before any logging ran. The receive handler now ALWAYS
-//! deserializes (member/session/extra are `serde_json::Value`) and logs the
-//! verbatim content as pretty JSON, so the next live operator call reveals the
-//! true shape from the `RX io.element.call.encryption_keys` banner.
+//! to deserialize before any logging ran. The receive handler always
+//! deserializes (member/session/extra are `serde_json::Value`) and logs
+//! sender, room, and key count only. Key material is never journaled.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 // `CollectStrategy` is the one type matrix-sdk takes but does not re-export; it
 // lives in matrix-sdk-base's crypto module (a direct dep added for this).
-use matrix_sdk_base::crypto::CollectStrategy;
 use matrix_sdk::{
     encryption::identities::Device,
     ruma::{events::macros::EventContent, events::AnyToDeviceEventContent, serde::Raw, RoomId},
 };
+use matrix_sdk_base::crypto::CollectStrategy;
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::mpsc;
 
@@ -125,7 +125,9 @@ where
                         D::Error::custom(format!("call key map index not a u8: {idx_str:?}"))
                     })?;
                     let key = key_val.as_str().map(str::to_owned).ok_or_else(|| {
-                        D::Error::custom(format!("call key map value not a string for index {index}"))
+                        D::Error::custom(format!(
+                            "call key map value not a string for index {index}"
+                        ))
                     })?;
                     keys.push(CallKey { index, key });
                 }
@@ -217,8 +219,7 @@ pub struct CallEncryptionKeys {
 // Element Call emits standard-alphabet base64 *with* padding for the 16 key
 // bytes; we encode the same and decode tolerantly (accept missing padding).
 
-const B64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn base64_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -294,6 +295,77 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Pure builder for the pre-Olm `io.element.call.encryption_keys` JSON body.
+///
+/// Wire shape MUST match matrix-js-sdk `ToDeviceKeyTransport.sendKey` +
+/// `getValidEventContent` (Element Call / Element X / Element Web):
+///
+/// - `keys` is a **single object** `{ index, key }` — NOT an array. Element
+///   checks `content.keys.key` and drops arrays as "Malformed Event: Missing
+///   keys field" → grey empty tile + silence while we still decrypt *their*
+///   frames (asymmetric failure).
+/// - `member.id` = `${user}:${device}` (Element's receive fallback).
+/// - No top-level `device_id` / `membershipID` (Element does not send them).
+///
+/// Extracted so unit tests lock the production path (not a hand-copied fixture).
+pub fn build_call_encryption_keys_content(
+    room_id: &str,
+    own_user: &str,
+    device_id: &str,
+    key_index: u8,
+    key: &[u8],
+    sent_ts_ms: u64,
+) -> serde_json::Value {
+    let membership_id = format!("{own_user}:{device_id}");
+    serde_json::json!({
+        "keys": { "index": key_index, "key": base64_encode(key) },
+        "member": {
+            "claimed_device_id": device_id,
+            "id": membership_id,
+        },
+        "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
+        "room_id": room_id,
+        "sent_ts": sent_ts_ms,
+    })
+}
+
+/// Element-side validation of an encryption_keys payload (mirrors
+/// `ToDeviceKeyTransport.getValidEventContent`). Returns `Ok(())` only when
+/// Element would accept and install the key.
+pub fn element_call_accepts_encryption_keys(
+    content: &serde_json::Value,
+) -> Result<(), &'static str> {
+    let room_id = content.get("room_id").and_then(|v| v.as_str());
+    if room_id.map(|s| s.is_empty()).unwrap_or(true) {
+        return Err("no room_id");
+    }
+    let keys = content.get("keys").ok_or("missing keys")?;
+    if !keys.is_object() {
+        return Err("keys must be a single object (not array/null)");
+    }
+    if keys
+        .get("key")
+        .and_then(|v| v.as_str())
+        .map(|s| s.is_empty())
+        .unwrap_or(true)
+    {
+        return Err("Missing keys field (keys.key)");
+    }
+    if keys.get("index").and_then(|v| v.as_u64()).is_none() {
+        return Err("Missing keys field (keys.index)");
+    }
+    let member = content.get("member").ok_or("missing member")?;
+    if member
+        .get("claimed_device_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.is_empty())
+        .unwrap_or(true)
+    {
+        return Err("Missing claimed_device_id");
+    }
+    Ok(())
+}
+
 /// Pull a string field out of a `serde_json::Value` object by key (None unless
 /// it's an object with that key holding a non-empty string).
 fn json_str(value: &serde_json::Value, key: &str) -> Option<String> {
@@ -364,16 +436,14 @@ impl AgentClient {
     /// `key_index` is the key-ring slot (Element Call ratchets `(i+1) % 256`);
     /// `key` is the raw 16 AES key bytes (base64-encoded here for the wire).
     ///
-    /// **Wire shape mirrors Element X.** `keys` is emitted as a SINGLE OBJECT
-    /// `{"index":N,"key":"b64"}` (not an array) to match Element X's
-    /// `ToDeviceKeyTransport`, whose receiver likely expects the same. Device
-    /// identification is provided the way Element X does it: the top-level
-    /// `device_id` and `membershipID` (`"<user>:<device>"`) are set so a peer can
-    /// map our key to our LiveKit identity `<user_id>:<device_id>`, in addition to
-    /// the legacy `member.id` / `member.claimed_device_id` (kept for
-    /// agent-to-agent). `session` is the room-scoped `m.call` default; `sent_ts`
-    /// is now. (Our own permissive receiver accepts both the array and
-    /// single-object shapes, so agent-to-agent is unaffected.)
+    /// **Wire shape mirrors matrix-js-sdk `ToDeviceKeyTransport`.** `keys` is a
+    /// SINGLE OBJECT `{"index":N,"key":"b64"}` (NOT an array — Element rejects
+    /// arrays as "Malformed Event: Missing keys field"). `member.claimed_device_id`
+    /// is the device; `member.id` is `${user}:${device}` (Element receive
+    /// fallback). No top-level `device_id` / `membershipID`. `session` is the
+    /// room-scoped `m.call` default; `sent_ts` is now. Built by
+    /// [`build_call_encryption_keys_content`]. Receive stays lenient
+    /// (array|object|map).
     ///
     /// Recipients are collected as all devices of all joined room members
     /// *except this agent's own user id*. Sent with
@@ -395,20 +465,23 @@ impl AgentClient {
             .device_id()
             .ok_or_else(|| anyhow!("agent has no device_id; cannot send call encryption keys"))?;
 
-        // Mirror Element X's verbatim `io.element.call.encryption_keys` wire shape
-        // (captured live from a real Element X client): `keys` is an ARRAY of
-        // `{index,key}`, and `member.claimed_device_id` carries the sending
-        // device — that, plus the to-device `sender`, is how the peer maps the key
-        // to our LiveKit identity `<user>:<device>`. (`member.id` is a per-session
-        // id on the Element X side; we send our user_id, which the receiver does
-        // not use for identity — `claimed_device_id` is the load-bearing field.)
-        let content = serde_json::json!({
-            "keys": [ { "index": key_index, "key": base64_encode(key) } ],
-            "member": { "claimed_device_id": device_id, "id": own_user },
-            "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
-            "room_id": room_id,
-            "sent_ts": now_ms(),
-        });
+        let content = build_call_encryption_keys_content(
+            room_id,
+            &own_user,
+            &device_id,
+            key_index,
+            key,
+            now_ms(),
+        );
+        let membership_id = format!("{own_user}:{device_id}");
+        tracing::info!(
+            room_id,
+            key_index,
+            claimed_device_id = %device_id,
+            member_id = %membership_id,
+            keys_is_object = content.get("keys").map(|k| k.is_object()).unwrap_or(false),
+            "TX io.element.call.encryption_keys wire shape (pre-Olm)"
+        );
 
         // Collect every device of every OTHER joined room member. `Device`s come
         // from the crypto store (populated by sync); we own them in `devices`
@@ -464,11 +537,7 @@ impl AgentClient {
     /// Gather every [`Device`] of every joined member of `room_id` *except*
     /// `own_user`'s devices. Best-effort per user: a user whose devices haven't
     /// synced yet contributes none (logged), rather than failing the whole set.
-    async fn other_member_devices(
-        &self,
-        room_id: &str,
-        own_user: &str,
-    ) -> Result<Vec<Device>> {
+    async fn other_member_devices(&self, room_id: &str, own_user: &str) -> Result<Vec<Device>> {
         use matrix_sdk::RoomMemberships;
 
         let room_id: &RoomId = room_id
@@ -538,22 +607,14 @@ impl AgentClient {
                     let sender_user_id = ev.sender.to_string();
                     let content = ev.content;
 
-                    // GROUND TRUTH: log the verbatim content as pretty JSON. The
-                    // Element X to-device shape is still unconfirmed (it failed to
-                    // deserialize before any logging ran); member/session/extra are
-                    // raw `Value`, so this round-trips EVERYTHING Element X sent.
-                    // This is the line the next live operator call will reveal the
-                    // true shape from.
-                    match serde_json::to_string_pretty(&content) {
-                        Ok(pretty) => tracing::info!(
-                            sender = %sender_user_id,
-                            "RX io.element.call.encryption_keys (verbatim content):\n{pretty}"
-                        ),
-                        Err(e) => tracing::info!(
-                            sender = %sender_user_id,
-                            "RX io.element.call.encryption_keys (content not re-serializable: {e:#})"
-                        ),
-                    }
+                    // Do not log key material. The payload is AES-GCM media
+                    // keys; dumping it to the journal is a live leak.
+                    tracing::info!(
+                        sender = %sender_user_id,
+                        room_id = %content.room_id,
+                        key_count = content.keys.len(),
+                        "RX io.element.call.encryption_keys (keys redacted)"
+                    );
 
                     // Extract the sender device id best-effort. The LiveKit
                     // participant identity is `<sender_user_id>:<sender_device_id>`,
@@ -679,7 +740,10 @@ mod tests {
         assert_eq!(content.room_id, "!room:matrix.inblock.io");
         assert_eq!(content.sent_ts, 1_733_000_000_000u64);
         // Device extraction from member.claimed_device_id.
-        assert_eq!(extract_sender_device_id(&content).as_deref(), Some("ABCDEFGHIJ"));
+        assert_eq!(
+            extract_sender_device_id(&content).as_deref(),
+            Some("ABCDEFGHIJ")
+        );
     }
 
     /// THE BUG FIX: Element X's to-device transport sends `keys` as a SINGLE
@@ -756,39 +820,90 @@ mod tests {
         }
     }
 
-    /// The send side must emit `keys` as a SINGLE OBJECT (Element X's shape),
-    /// plus Element-X-style device identification (`device_id` + `membershipID`).
-    /// This mirrors the JSON `send_call_encryption_keys` builds.
+    /// Production builder (`build_call_encryption_keys_content`) must emit the
+    /// matrix-js-sdk ToDeviceKeyTransport shape. Element drops array `keys` as
+    /// "Malformed Event: Missing keys field" → grey empty tile (2026-07-16).
     #[test]
-    fn send_side_emits_keys_as_array_matching_element_x() {
+    fn send_side_emits_keys_as_single_object_matching_element_call() {
         let (key_bytes, key_b64) = sample_key();
         let own_user = "@agent:matrix.inblock.io";
         let device_id = "ABCDEFGHIJ";
+        let room = "!room:matrix.inblock.io";
+        let membership_id = format!("{own_user}:{device_id}");
 
-        // Exactly the JSON the send path constructs — mirroring the verbatim
-        // Element X `io.element.call.encryption_keys` shape captured live.
-        let content = json!({
-            "keys": [ { "index": 3, "key": base64_encode(&key_bytes) } ],
-            "member": { "claimed_device_id": device_id, "id": own_user },
-            "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
-            "room_id": "!room:matrix.inblock.io",
-            "sent_ts": 1u64,
-        });
+        let content =
+            build_call_encryption_keys_content(room, own_user, device_id, 3, &key_bytes, 1);
 
-        // `keys` is an ARRAY (Element X's shape), and member.claimed_device_id
-        // carries the sending device.
-        assert!(content["keys"].is_array(), "send must emit keys as an array (Element X shape)");
-        assert_eq!(content["keys"][0]["index"], 3);
-        assert_eq!(content["keys"][0]["key"], key_b64);
+        assert!(
+            element_call_accepts_encryption_keys(&content).is_ok(),
+            "Element getValidEventContent must accept: {:?}",
+            element_call_accepts_encryption_keys(&content)
+        );
+        assert!(
+            content["keys"].is_object(),
+            "send must emit keys as a single object"
+        );
+        assert!(!content["keys"].is_array());
+        assert_eq!(content["keys"]["index"], 3);
+        assert_eq!(content["keys"]["key"], key_b64);
         assert_eq!(content["member"]["claimed_device_id"], device_id);
+        assert_eq!(content["member"]["id"], membership_id);
+        assert_eq!(content["room_id"], room);
+        // Element ToDeviceKeyTransport does not put these top-level.
+        assert!(content.get("device_id").is_none());
+        assert!(content.get("membershipID").is_none());
 
-        // Our own permissive receiver still parses it back to one CallKey, and
-        // extracts the device from member.claimed_device_id.
+        // Our own permissive receiver still parses it back to one CallKey.
         let parsed: CallEncryptionKeysEventContent =
             serde_json::from_value(content).expect("our receiver accepts our own send shape");
         assert_eq!(parsed.keys.len(), 1);
         assert_eq!(parsed.keys[0].index, 3);
         assert_eq!(extract_sender_device_id(&parsed).as_deref(), Some(device_id));
+    }
+
+    /// Regression: array-shaped `keys` is what Element Call rejects (grey tile).
+    /// The production builder must never emit this; the validator must refuse it.
+    #[test]
+    fn element_call_rejects_array_keys_shape() {
+        let (key_bytes, key_b64) = sample_key();
+        let malformed = json!({
+            "keys": [ { "index": 0, "key": key_b64 } ],
+            "member": { "claimed_device_id": "DEV", "id": "@u:hs:DEV" },
+            "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
+            "room_id": "!r:hs",
+            "sent_ts": 1u64,
+        });
+        assert_eq!(
+            element_call_accepts_encryption_keys(&malformed),
+            Err("keys must be a single object (not array/null)")
+        );
+        // And the good builder never produces that.
+        let good = build_call_encryption_keys_content("!r:hs", "@u:hs", "DEV", 0, &key_bytes, 1);
+        assert!(element_call_accepts_encryption_keys(&good).is_ok());
+        assert!(good["keys"].is_object());
+    }
+
+    /// member.id must be user:device (LiveKit identity / Element fallback), not
+    /// bare mxid — hashed RTC identities and delayed-key membership matching
+    /// depend on consistent memberId.
+    #[test]
+    fn member_id_is_user_colon_device_not_bare_mxid() {
+        let (key_bytes, _) = sample_key();
+        let user = "@did-key-z6mkmwzijj2k3ckqvqnmmgvkefmhdse4zxrfvqksxdmgba4v:matrix.inblock.io";
+        let dev = "SIWX_4137b749";
+        let content = build_call_encryption_keys_content(
+            "!bNDjt:matrix.inblock.io",
+            user,
+            dev,
+            0,
+            &key_bytes,
+            42,
+        );
+        assert_eq!(
+            content["member"]["id"].as_str().unwrap(),
+            format!("{user}:{dev}")
+        );
+        assert_ne!(content["member"]["id"].as_str().unwrap(), user);
     }
 
     /// Device-id extraction fallbacks: member.device_id, membershipID parsing
@@ -806,7 +921,10 @@ mod tests {
             "member": { "membershipID": "@did-pkh-eip155:1:0xABC:6zqlNZdevicekey" }
         }))
         .unwrap();
-        assert_eq!(extract_sender_device_id(&c).as_deref(), Some("6zqlNZdevicekey"));
+        assert_eq!(
+            extract_sender_device_id(&c).as_deref(),
+            Some("6zqlNZdevicekey")
+        );
 
         // top-level device_id (captured by `extra`)
         let c: CallEncryptionKeysEventContent =
