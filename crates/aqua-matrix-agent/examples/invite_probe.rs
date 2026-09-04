@@ -20,7 +20,9 @@ struct Args {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn,aqua_matrix_agent=info".into()))
+        .with_env_filter(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "warn,aqua_matrix_agent=info".into()),
+        )
         .try_init()
         .ok();
     let args = Args::parse();

@@ -101,7 +101,10 @@ impl WorkJournal {
             .and_then(|bytes| std::fs::write(&tmp, bytes))
             .and_then(|()| std::fs::rename(&tmp, path));
         if let Err(e) = res {
-            tracing::warn!("failed to persist work-journal to {}: {e:#}", path.display());
+            tracing::warn!(
+                "failed to persist work-journal to {}: {e:#}",
+                path.display()
+            );
         }
     }
 
@@ -204,7 +207,10 @@ mod tests {
         let dir = tmp_dir("dedupe");
         let j = WorkJournal::load_or_empty(&dir);
         assert!(j.enqueue(item("$a")));
-        assert!(!j.enqueue(item("$a")), "duplicate event_id must not re-enqueue");
+        assert!(
+            !j.enqueue(item("$a")),
+            "duplicate event_id must not re-enqueue"
+        );
         assert!(j.enqueue(item("$b")));
         assert_eq!(j.len(), 2);
     }
@@ -221,7 +227,12 @@ mod tests {
         assert_eq!(j.pending_work().len(), 0);
         let d = j.pending_deliveries();
         assert_eq!(d.len(), 1);
-        assert_eq!(d[0].state, WorkState::ToDeliver { text: "the answer".into() });
+        assert_eq!(
+            d[0].state,
+            WorkState::ToDeliver {
+                text: "the answer".into()
+            }
+        );
 
         j.mark_done("$a");
         assert!(j.is_empty());
@@ -240,7 +251,11 @@ mod tests {
         }
         // Simulate a restart: a fresh journal loads the same file.
         let j2 = WorkJournal::load_or_empty(&dir);
-        assert_eq!(j2.len(), 2, "done item must not survive; the other two must");
+        assert_eq!(
+            j2.len(),
+            2,
+            "done item must not survive; the other two must"
+        );
         let pending = j2.pending_work();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].event_id, "$pending");
@@ -250,7 +265,9 @@ mod tests {
         assert_eq!(deliveries[0].event_id, "$answered");
         assert_eq!(
             deliveries[0].state,
-            WorkState::ToDeliver { text: "cached reply".into() }
+            WorkState::ToDeliver {
+                text: "cached reply".into()
+            }
         );
     }
 

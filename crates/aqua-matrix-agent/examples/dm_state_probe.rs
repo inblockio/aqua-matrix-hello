@@ -26,9 +26,7 @@ async fn main() -> Result<()> {
     let env = |k: &str| std::env::var(k).ok();
     let target = env("AGENT_TARGET").context("set AGENT_TARGET to the agent's MXID")?;
     let config = AgentConfig {
-        key_file: env("AGENT_KEY_FILE")
-            .context("set AGENT_KEY_FILE")?
-            .into(),
+        key_file: env("AGENT_KEY_FILE").context("set AGENT_KEY_FILE")?.into(),
         siwx_url: env("SIWX_URL").unwrap_or_else(|| "https://siwx-oidc.inblock.io".into()),
         matrix_url: env("MATRIX_URL").unwrap_or_else(|| "https://matrix.inblock.io".into()),
         client_id: env("OIDC_CLIENT_ID"),

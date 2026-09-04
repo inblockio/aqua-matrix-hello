@@ -181,7 +181,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    if args.message.is_none() && !args.read && args.display_name.is_none() && args.avatar.is_none() {
+    if args.message.is_none() && !args.read && args.display_name.is_none() && args.avatar.is_none()
+    {
         println!("connected as {} ({})", agent.user_id(), agent.did());
         println!("use --message to send or --read to read messages");
     }

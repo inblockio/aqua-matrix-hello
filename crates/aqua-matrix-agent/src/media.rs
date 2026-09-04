@@ -213,7 +213,9 @@ impl AgentClient {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let filename = file_name_of(path, "file");
         let mime = mime_guess::from_path(path).first_or_octet_stream();
-        let info = AttachmentInfo::File(BaseFileInfo { size: uint(data.len()) });
+        let info = AttachmentInfo::File(BaseFileInfo {
+            size: uint(data.len()),
+        });
         let config = attach_config(info, caption);
         self.send_attachment_inner(target, &filename, &mime, data, config)
             .await
@@ -437,9 +439,8 @@ impl AgentClient {
             let Ok(deserialized) = event.raw().deserialize() else {
                 continue;
             };
-            let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
-                msg_event,
-            )) = deserialized
+            let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(msg_event)) =
+                deserialized
             else {
                 continue;
             };
@@ -552,7 +553,11 @@ mod tests {
     fn waveform_is_normalised_and_sized() {
         for ms in [0u64, 500, 3_000, 60_000, 600_000] {
             let w = synth_waveform(ms);
-            assert!(w.len() >= 24 && w.len() <= 120, "len {} for {ms}ms", w.len());
+            assert!(
+                w.len() >= 24 && w.len() <= 120,
+                "len {} for {ms}ms",
+                w.len()
+            );
             assert!(
                 w.iter().all(|v| (0.0..=1.0).contains(v)),
                 "waveform out of range for {ms}ms"

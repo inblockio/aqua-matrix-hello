@@ -122,7 +122,11 @@ impl AgentClient {
         // member_id = `{device_id}_m.call` (device + application), per the
         // deployed Element Call. ruma renders the key as `_{user}_{member_id}`.
         let member_id = format!("{device_id}_m.call");
-        Ok(CallMemberStateKey::new(user_id, Some(member_id), underscore))
+        Ok(CallMemberStateKey::new(
+            user_id,
+            Some(member_id),
+            underscore,
+        ))
     }
 
     /// Publish this agent's **MatrixRTC membership** (`org.matrix.msc3401.call.member`)
@@ -222,7 +226,10 @@ impl AgentClient {
         let empty = CallMemberEventContent::new_empty(None);
 
         let owned_key = self.rtc_member_state_key(true)?;
-        match room.send_state_event_for_key(&owned_key, empty.clone()).await {
+        match room
+            .send_state_event_for_key(&owned_key, empty.clone())
+            .await
+        {
             Ok(resp) => {
                 tracing::info!(
                     state_key = owned_key.as_ref(),

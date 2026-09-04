@@ -122,14 +122,26 @@ async fn e2ee_bidirectional_messaging() {
     let agent_a = AgentClient::connect(agent_config("agent.pem"))
         .await
         .expect("Agent A failed to connect");
-    println!("Agent A connected: {} ({})", agent_a.user_id(), agent_a.did());
+    println!(
+        "Agent A connected: {} ({})",
+        agent_a.user_id(),
+        agent_a.did()
+    );
 
     let agent_b = AgentClient::connect(agent_config("agent-b.pem"))
         .await
         .expect("Agent B failed to connect");
-    println!("Agent B connected: {} ({})", agent_b.user_id(), agent_b.did());
+    println!(
+        "Agent B connected: {} ({})",
+        agent_b.user_id(),
+        agent_b.did()
+    );
 
-    assert_ne!(agent_a.user_id(), agent_b.user_id(), "agents must have different identities");
+    assert_ne!(
+        agent_a.user_id(),
+        agent_b.user_id(),
+        "agents must have different identities"
+    );
 
     // Phase 1: Establish DM room and get both agents into it.
     // The setup message creates the room and invites Agent B.
@@ -141,7 +153,10 @@ async fn e2ee_bidirectional_messaging() {
 
     // Agent B joins the room
     sync_n(&agent_b, 2).await;
-    agent_b.join_invited_rooms().await.expect("Agent B join failed");
+    agent_b
+        .join_invited_rooms()
+        .await
+        .expect("Agent B join failed");
     sync_n(&agent_b, 2).await;
     println!("Agent B joined the room");
 
@@ -212,7 +227,8 @@ async fn e2ee_bidirectional_messaging() {
         messages.iter().map(|m| &m.body).collect::<Vec<_>>()
     );
     assert_ne!(
-        found.unwrap().body, "[unable to decrypt]",
+        found.unwrap().body,
+        "[unable to decrypt]",
         "message from B was not decryptable by A (E2EE key exchange failed)"
     );
     println!("Agent A received and decrypted: {msg_b_to_a}");
@@ -246,7 +262,8 @@ async fn e2ee_bidirectional_messaging() {
         messages.iter().map(|m| &m.body).collect::<Vec<_>>()
     );
     assert_ne!(
-        found.unwrap().body, "[unable to decrypt]",
+        found.unwrap().body,
+        "[unable to decrypt]",
         "reply from A was not decryptable by B (E2EE key exchange failed)"
     );
     println!("Agent B received and decrypted: {msg_a_to_b}");
@@ -292,7 +309,12 @@ async fn e2ee_device_logout_history_survives() {
         .await
         .expect("Agent B failed to connect");
     println!("A = {} ({})", agent_a.user_id(), agent_a.did());
-    println!("B = {} ({})  device={:?}", agent_b.user_id(), agent_b.did(), agent_b.device_id());
+    println!(
+        "B = {} ({})  device={:?}",
+        agent_b.user_id(),
+        agent_b.did(),
+        agent_b.device_id()
+    );
 
     // --- Establish the shared encrypted room + exchange keys -----------------
     agent_a
@@ -347,7 +369,10 @@ async fn e2ee_device_logout_history_survives() {
         .expect("Agent B has no access token to sign out with");
     let siwx_url = std::env::var("SIWX_E2E_SIWX_URL")
         .unwrap_or_else(|_| "https://siwx-oidc.inblock.io".to_string());
-    let logout_url = format!("{}/_matrix/client/v3/logout", siwx_url.trim_end_matches('/'));
+    let logout_url = format!(
+        "{}/_matrix/client/v3/logout",
+        siwx_url.trim_end_matches('/')
+    );
     println!("Signing Agent B's device out via siwx-oidc {logout_url} (explicit DeleteDevice) ...");
     let resp = reqwest::Client::new()
         .post(&logout_url)
@@ -363,7 +388,9 @@ async fn e2ee_device_logout_history_survives() {
         status.is_success(),
         "siwx-oidc /logout did not return 2xx (device sign-out failed): HTTP {status} {body}"
     );
-    println!("Agent B device signed out (siwx-oidc deleted the Synapse device + revoked B's tokens)");
+    println!(
+        "Agent B device signed out (siwx-oidc deleted the Synapse device + revoked B's tokens)"
+    );
 
     // Give Synapse a moment; it caches introspection ~2min but the logout itself
     // is immediate server-side. A's session is on a DIFFERENT device and is
@@ -386,7 +413,9 @@ async fn e2ee_device_logout_history_survives() {
         "COLLATERAL DAMAGE: A can no longer DECRYPT B's pre-logout message after B's device sign-out \
          (the Megolm history key was lost) — E2EE history did NOT survive"
     );
-    println!("R-K2 (1) PASS: A still decrypts B's pre-logout message after B's sign-out: {pre_logout}");
+    println!(
+        "R-K2 (1) PASS: A still decrypts B's pre-logout message after B's sign-out: {pre_logout}"
+    );
 
     // --- (2) Room is still encrypted from A's view -------------------------
     {
@@ -419,11 +448,15 @@ async fn e2ee_device_logout_history_survives() {
         "A could not send + decrypt its OWN new message after B's sign-out (A's Megolm session damaged): {:?}",
         final_msgs.iter().map(|m| &m.body).collect::<Vec<_>>()
     );
-    println!("R-K2 (3) PASS: A sent + read-back-decrypted a NEW message after B's sign-out: {post}");
+    println!(
+        "R-K2 (3) PASS: A sent + read-back-decrypted a NEW message after B's sign-out: {post}"
+    );
 
     println!("\nR-K2 device-logout survivability test PASSED");
     println!("  B's device signed out via /_matrix/client/v3/logout (MSC3861 → siwx-oidc)");
-    println!("  A (other participant) retained decryptable history + encrypted room + working crypto");
+    println!(
+        "  A (other participant) retained decryptable history + encrypted room + working crypto"
+    );
 }
 
 /// Regression test for the `413 M_TOO_LARGE` streaming-edit failure: a large
@@ -532,16 +565,19 @@ async fn streaming_rollover_delivers_large_reply_without_413() {
     let mut missing: Vec<String> = Vec::new();
     for attempt in 0..30 {
         sync_n(&agent_b, 1).await;
-        messages = agent_b
-            .messages(&room_b, 200)
-            .await
-            .expect("read messages");
+        messages = agent_b.messages(&room_b, 200).await.expect("read messages");
         missing = (0..PARAS)
             .map(sentinel)
             .filter(|s| !messages.iter().any(|m| m.body.contains(s)))
             .collect();
-        let utd = messages.iter().filter(|m| m.body == "[unable to decrypt]").count();
-        println!("settle attempt {attempt}: {} sentinels missing, {utd} UTD in window", missing.len());
+        let utd = messages
+            .iter()
+            .filter(|m| m.body == "[unable to decrypt]")
+            .count();
+        println!(
+            "settle attempt {attempt}: {} sentinels missing, {utd} UTD in window",
+            missing.len()
+        );
         if missing.is_empty() {
             break;
         }
@@ -586,7 +622,10 @@ async fn streaming_rollover_delivers_large_reply_without_413() {
     let one_holds_all = messages
         .iter()
         .any(|m| (0..PARAS).all(|i| m.body.contains(&sentinel(i))));
-    assert!(!one_holds_all, "the whole reply fit in one message — no rollover");
+    assert!(
+        !one_holds_all,
+        "the whole reply fit in one message — no rollover"
+    );
 
     println!(
         "\nROLLOVER E2E PASSED: {} bytes delivered across {carrying} messages, all {PARAS} sentinels intact, no 413",
@@ -670,7 +709,10 @@ async fn durable_journal_redelivers_reply_to_peer() {
             .expect("durable redelivery send must confirm");
         journal.mark_done(&item.event_id);
     }
-    assert!(journal.is_empty(), "journal must drain after confirmed delivery");
+    assert!(
+        journal.is_empty(),
+        "journal must drain after confirmed delivery"
+    );
 
     // The peer must actually receive the redelivered reply (settle for keys).
     let room_b = agent_b
@@ -687,7 +729,10 @@ async fn durable_journal_redelivers_reply_to_peer() {
             break;
         }
     }
-    assert!(got, "peer never received the durably-redelivered reply {reply}");
+    assert!(
+        got,
+        "peer never received the durably-redelivered reply {reply}"
+    );
 
     let _ = std::fs::remove_dir_all(&journal_dir);
     println!("\nDURABLE REDELIVERY E2E PASSED: journalled reply survived reload, delivered to peer, journal drained");
@@ -775,8 +820,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 /// `unpaddedBase64.EncodeToString` (matrix base64.RawStdEncoding) produces, which
 /// lk-jwt-service uses to encode the SHA-256 LiveKit room alias.
 fn unpadded_base64(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -983,7 +1027,12 @@ async fn rtc_jwt_handshake() {
         println!("openid_token (access_token redacted): {redacted}");
     }
     // Sanity: the four fields lk-jwt-service reads must be present.
-    for field in ["access_token", "token_type", "matrix_server_name", "expires_in"] {
+    for field in [
+        "access_token",
+        "token_type",
+        "matrix_server_name",
+        "expires_in",
+    ] {
         assert!(
             openid_token.get(field).is_some(),
             "openid_token missing field `{field}`: {openid_token}"
@@ -1120,9 +1169,8 @@ fn tiny_png() -> Vec<u8> {
         0x08, 0x06, 0x00, 0x00, 0x00, 0x72, 0xB6, 0x0D, 0x24, // bit depth/color/etc + CRC
         0x00, 0x00, 0x00, 0x16, 0x49, 0x44, 0x41, 0x54, // IDAT length + type
         0x78, 0x9C, 0x62, 0xF8, 0xCF, 0xC0, 0xF0, 0x9F, // zlib data
-        0x81, 0x81, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF,
-        0x03, 0x00, 0x0E, 0xFD, 0x03, 0xFD, 0x00, 0x00,
-        0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82, // IEND
+        0x81, 0x81, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x03, 0x00, 0x0E, 0xFD, 0x03, 0xFD, 0x00,
+        0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82, // IEND
     ];
     PNG.to_vec()
 }
@@ -1151,7 +1199,11 @@ async fn e2ee_media_exchange() {
     let agent_b = AgentClient::connect(agent_config("agent-b.pem"))
         .await
         .expect("Agent B failed to connect");
-    println!("Agent B connected: {} ({})", agent_b.user_id(), agent_b.did());
+    println!(
+        "Agent B connected: {} ({})",
+        agent_b.user_id(),
+        agent_b.did()
+    );
 
     assert_ne!(
         agent_a.user_id(),
@@ -1169,7 +1221,10 @@ async fn e2ee_media_exchange() {
     println!("DM room created by Agent A");
 
     sync_n(&agent_b, 2).await;
-    agent_b.join_invited_rooms().await.expect("Agent B join failed");
+    agent_b
+        .join_invited_rooms()
+        .await
+        .expect("Agent B join failed");
     sync_n(&agent_b, 2).await;
     println!("Agent B joined the room");
 
@@ -1201,14 +1256,20 @@ async fn e2ee_media_exchange() {
         .send_image(agent_a.user_id(), &png_path, Some(&format!("img-{tag}")))
         .await
         .expect("Agent B failed to send image");
-    println!("Agent B sent IMAGE ({} bytes, event {img_event})", png_bytes.len());
+    println!(
+        "Agent B sent IMAGE ({} bytes, event {img_event})",
+        png_bytes.len()
+    );
 
     let got_png = recv_media(&agent_a, &room_a, MediaKind::Image, "IMAGE").await;
     assert_eq!(
         got_png, png_bytes,
         "IMAGE round-trip mismatch: A's decrypted bytes != B's sent bytes"
     );
-    println!("Agent A downloaded + decrypted IMAGE; {} bytes match exactly", got_png.len());
+    println!(
+        "Agent A downloaded + decrypted IMAGE; {} bytes match exactly",
+        got_png.len()
+    );
 
     // ---- Channel 2: A → B FILE --------------------------------------------
     // Now A sends. A's outbound session is shared with B as part of receiving B's
@@ -1220,14 +1281,20 @@ async fn e2ee_media_exchange() {
         .send_file(agent_b.user_id(), &file_path, Some(&format!("file-{tag}")))
         .await
         .expect("Agent A failed to send file");
-    println!("Agent A sent FILE ({} bytes, event {file_event})", file_bytes.len());
+    println!(
+        "Agent A sent FILE ({} bytes, event {file_event})",
+        file_bytes.len()
+    );
 
     let got_file = recv_media(&agent_b, &room_b, MediaKind::File, "FILE").await;
     assert_eq!(
         got_file, file_bytes,
         "FILE round-trip mismatch: B's decrypted bytes != A's sent bytes"
     );
-    println!("Agent B downloaded + decrypted FILE; {} bytes match exactly", got_file.len());
+    println!(
+        "Agent B downloaded + decrypted FILE; {} bytes match exactly",
+        got_file.len()
+    );
 
     // ---- Channel 3: B → A VOICE -------------------------------------------
     // A tiny "voice" payload — the connector does not decode audio, so any bytes
@@ -1250,12 +1317,24 @@ async fn e2ee_media_exchange() {
         got_voice, voice_bytes,
         "VOICE round-trip mismatch: A's decrypted bytes != B's sent bytes"
     );
-    println!("Agent A downloaded + decrypted VOICE; {} bytes (kind=voice)", got_voice.len());
+    println!(
+        "Agent A downloaded + decrypted VOICE; {} bytes (kind=voice)",
+        got_voice.len()
+    );
 
     println!("\nE2EE media exchange test PASSED");
-    println!("  IMAGE B→A: round-trip + decrypt OK ({} bytes)", got_png.len());
-    println!("  FILE  A→B: round-trip + decrypt OK ({} bytes)", got_file.len());
-    println!("  VOICE B→A: round-trip + decrypt OK ({} bytes, kind=voice)", got_voice.len());
+    println!(
+        "  IMAGE B→A: round-trip + decrypt OK ({} bytes)",
+        got_png.len()
+    );
+    println!(
+        "  FILE  A→B: round-trip + decrypt OK ({} bytes)",
+        got_file.len()
+    );
+    println!(
+        "  VOICE B→A: round-trip + decrypt OK ({} bytes, kind=voice)",
+        got_voice.len()
+    );
 }
 
 /// Sync `receiver` a few times, look for an inbound attachment of `want` via
@@ -1288,7 +1367,9 @@ async fn recv_media(
             }
         }
     }
-    panic!("{label}: receiver never received a decryptable {want:?} attachment after 8 sync rounds");
+    panic!(
+        "{label}: receiver never received a decryptable {want:?} attachment after 8 sync rounds"
+    );
 }
 
 /// Verify LIVE that an aqua agent can advertise a **MatrixRTC membership**
@@ -1311,9 +1392,7 @@ async fn recv_media(
 #[tokio::test]
 async fn rtc_member_advertise() {
     use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
-    use matrix_sdk::ruma::events::call::member::{
-        CallMemberEventContent, CallMemberStateKey,
-    };
+    use matrix_sdk::ruma::events::call::member::{CallMemberEventContent, CallMemberStateKey};
     use matrix_sdk::ruma::events::StateEventType;
     use matrix_sdk::ruma::{OwnedUserId, RoomId};
 
@@ -1413,8 +1492,7 @@ async fn rtc_member_advertise() {
                 {
                     // Prefer the `content` sub-object for printing; fall back to
                     // the whole event if the shape is unexpected.
-                    let content_json =
-                        full.get("content").cloned().unwrap_or_else(|| full.clone());
+                    let content_json = full.get("content").cloned().unwrap_or_else(|| full.clone());
                     return Some((key.as_ref().to_owned(), content, content_json));
                 }
             }
@@ -1432,7 +1510,13 @@ async fn rtc_member_advertise() {
         .expect("A could not read back its own RTC membership");
     println!("\n=== A read-back: state_key = {key_a} ===");
     println!("{}", serde_json::to_string_pretty(&raw_a).unwrap());
-    assert_session_focus(&content_a, &a_device, &room_id, focus_url, "A self read-back");
+    assert_session_focus(
+        &content_a,
+        &a_device,
+        &room_id,
+        focus_url,
+        "A self read-back",
+    );
 
     // --- (3) B (different user) discovers A's membership -------------------
     sync_n(&agent_b, 3).await;
@@ -1442,7 +1526,13 @@ async fn rtc_member_advertise() {
     println!("\n=== B cross-user read of A's membership: state_key = {key_b} ===");
     println!("{}", serde_json::to_string_pretty(&raw_b).unwrap());
     assert_eq!(key_a, key_b, "A and B disagree on the membership state key");
-    assert_session_focus(&content_b, &a_device, &room_id, focus_url, "B cross-user read");
+    assert_session_focus(
+        &content_b,
+        &a_device,
+        &room_id,
+        focus_url,
+        "B cross-user read",
+    );
     println!("\nCROSS-USER DISCOVERY PROVEN: B sees A's MatrixRTC membership.");
 
     // --- (4) A clears membership; read-back is Empty ----------------------
@@ -1457,9 +1547,9 @@ async fn rtc_member_advertise() {
             println!("\n=== after clear: Empty membership (left call) ===");
             println!("{}", serde_json::to_string_pretty(&raw).unwrap());
         }
-        Some((_, other, raw)) => panic!(
-            "after clear_rtc_member the membership was NOT Empty: {other:?}\nraw: {raw}"
-        ),
+        Some((_, other, raw)) => {
+            panic!("after clear_rtc_member the membership was NOT Empty: {other:?}\nraw: {raw}")
+        }
         None => panic!("after clear_rtc_member the state event vanished entirely (expected Empty)"),
     }
     println!("\nrtc_member_advertise: ALL CHECKS PASSED");
@@ -1474,9 +1564,7 @@ fn assert_session_focus(
     expect_focus_url: &str,
     label: &str,
 ) {
-    use matrix_sdk::ruma::events::call::member::{
-        ActiveFocus, CallMemberEventContent, Focus,
-    };
+    use matrix_sdk::ruma::events::call::member::{ActiveFocus, CallMemberEventContent, Focus};
     let session = match content {
         CallMemberEventContent::SessionContent(s) => s,
         other => panic!("{label}: expected SessionContent, got {other:?}"),

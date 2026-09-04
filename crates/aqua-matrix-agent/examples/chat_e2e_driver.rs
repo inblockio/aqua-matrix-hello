@@ -105,7 +105,10 @@ async fn wait_for<F: Fn(&str) -> bool>(
             }
         }
         if Instant::now() >= deadline {
-            println!("    [driver] TIMEOUT after {:?} waiting for: {label}", timeout);
+            println!(
+                "    [driver] TIMEOUT after {:?} waiting for: {label}",
+                timeout
+            );
             return (collected, false);
         }
         tokio::time::sleep(POLL).await;
@@ -159,10 +162,29 @@ fn expiring(agent: &AgentClient) -> bool {
 /// Absorb the first-message-after-reconnect Megolm race: send a benign prompt
 /// and wait for any reply, so the graded prompt that follows is never the
 /// (race-prone) first message on a freshly reconnected session.
-async fn warmup_ready(agent: &AgentClient, room_id: &str, seen: &mut HashSet<String>, channel: &str) {
+async fn warmup_ready(
+    agent: &AgentClient,
+    room_id: &str,
+    seen: &mut HashSet<String>,
+    channel: &str,
+) {
     println!("    [driver] warmup after reconnect (absorb re-key race)...");
-    send(agent, channel, "(e2e readiness check — please reply: ready)").await;
-    let _ = wait_for(agent, room_id, seen, channel, "warmup", |_| true, Duration::from_secs(120)).await;
+    send(
+        agent,
+        channel,
+        "(e2e readiness check — please reply: ready)",
+    )
+    .await;
+    let _ = wait_for(
+        agent,
+        room_id,
+        seen,
+        channel,
+        "warmup",
+        |_| true,
+        Duration::from_secs(120),
+    )
+    .await;
 }
 
 /// Reconnect+warmup only if the token is near expiry — minimises reconnects (so
@@ -197,7 +219,11 @@ async fn main() {
     let channel = args.target.clone();
 
     let mut agent = connect_agent(&args).await;
-    println!("[driver] connected as {} ({})", agent.user_id(), agent.did());
+    println!(
+        "[driver] connected as {} ({})",
+        agent.user_id(),
+        agent.did()
+    );
     println!("[driver] target channel: {channel}");
 
     // --- Converge on a single shared DM room ---------------------------------
@@ -228,7 +254,12 @@ async fn main() {
             break;
         }
         // No room yet — create it (also (re)invites the daemon).
-        send(&agent, &channel, "[driver] e2e session setup — establishing room").await;
+        send(
+            &agent,
+            &channel,
+            "[driver] e2e session setup — establishing room",
+        )
+        .await;
         tokio::time::sleep(POLL).await;
     }
     let room_id = room_id.expect("DM room never resolved — is the daemon's invite pending?");
@@ -278,7 +309,11 @@ async fn main() {
     let approve_before = exists(&args.approve_canary);
     send(&agent, &channel, &format!("rm {}", args.approve_canary)).await;
     let (_, got_confirm) = wait_for(
-        &agent, &room_id, &mut seen, &channel, "t1-plan",
+        &agent,
+        &room_id,
+        &mut seen,
+        &channel,
+        "t1-plan",
         |b| b.contains("[confirm]"),
         Duration::from_secs(240),
     )
@@ -287,7 +322,11 @@ async fn main() {
         send(&agent, &channel, "yes").await;
         // execution result: any new non-confirm channel message
         let _ = wait_for(
-            &agent, &room_id, &mut seen, &channel, "t1-exec",
+            &agent,
+            &room_id,
+            &mut seen,
+            &channel,
+            "t1-exec",
             |b| !b.contains("[confirm]"),
             Duration::from_secs(240),
         )
@@ -311,7 +350,11 @@ async fn main() {
     let deny_before = exists(&args.deny_canary);
     send(&agent, &channel, &format!("rm {}", args.deny_canary)).await;
     let (_, got_confirm2) = wait_for(
-        &agent, &room_id, &mut seen, &channel, "t2-plan",
+        &agent,
+        &room_id,
+        &mut seen,
+        &channel,
+        "t2-plan",
         |b| b.contains("[confirm]"),
         Duration::from_secs(240),
     )
@@ -320,7 +363,11 @@ async fn main() {
     if got_confirm2 {
         send(&agent, &channel, "no").await;
         let (_, aborted) = wait_for(
-            &agent, &room_id, &mut seen, &channel, "t2-abort",
+            &agent,
+            &room_id,
+            &mut seen,
+            &channel,
+            "t2-abort",
             |b| b.contains("[aborted]"),
             Duration::from_secs(240),
         )
@@ -353,7 +400,11 @@ async fn main() {
     )
     .await;
     let (_, got_ask) = wait_for(
-        &agent, &room_id, &mut seen, &channel, "t3-ask",
+        &agent,
+        &room_id,
+        &mut seen,
+        &channel,
+        "t3-ask",
         |b| b.contains("[ask]"),
         Duration::from_secs(240),
     )
@@ -362,7 +413,11 @@ async fn main() {
     if got_ask {
         send(&agent, &channel, "teal").await;
         let (msgs, _) = wait_for(
-            &agent, &room_id, &mut seen, &channel, "t3-final",
+            &agent,
+            &room_id,
+            &mut seen,
+            &channel,
+            "t3-final",
             |b| !b.contains("[ask]") && b.to_lowercase().contains("teal"),
             Duration::from_secs(240),
         )
@@ -379,10 +434,22 @@ async fn main() {
 
     // --- Summary -------------------------------------------------------------
     println!("\n===SUMMARY===");
-    println!("T0 liveness        : {}", if t0_ok { "PASS" } else { "FAIL" });
-    println!("T1 Phase A approve : {}", if t1_pass { "PASS" } else { "FAIL" });
-    println!("T2 Phase A deny    : {}", if t2_pass { "PASS" } else { "FAIL" });
-    println!("T3 Phase B ask     : {}", if t3_pass { "PASS" } else { "FAIL" });
+    println!(
+        "T0 liveness        : {}",
+        if t0_ok { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "T1 Phase A approve : {}",
+        if t1_pass { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "T2 Phase A deny    : {}",
+        if t2_pass { "PASS" } else { "FAIL" }
+    );
+    println!(
+        "T3 Phase B ask     : {}",
+        if t3_pass { "PASS" } else { "FAIL" }
+    );
     let all = t0_ok && t1_pass && t2_pass && t3_pass;
     println!("OVERALL            : {}", if all { "PASS" } else { "FAIL" });
 }

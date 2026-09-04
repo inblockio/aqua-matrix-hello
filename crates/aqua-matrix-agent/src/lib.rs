@@ -18,7 +18,6 @@ pub use rtc_keys::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use matrix_sdk::{
     config::SyncSettings,
     room::MessagesOptions,
@@ -33,10 +32,11 @@ use matrix_sdk::{
     },
     Client, SessionMeta, SessionTokens,
 };
+use mime::Mime;
 use serde::{Deserialize, Serialize};
 use siwx_oidc_auth::SiwxKey;
 use std::path::{Path, PathBuf};
-use mime::Mime;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // Config file (persisted OIDC credentials)
@@ -410,14 +410,20 @@ fn unix_now() -> u64 {
 fn is_store_mismatch(err: &anyhow::Error) -> bool {
     // matrix-sdk wraps this from the crypto store. The string is the load-bearing
     // signal — there is no typed error variant exposed at this layer.
-    let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" | ");
+    let chain: String = err
+        .chain()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(" | ");
     chain.contains("account in the store doesn't match")
         || chain.contains("crypto store the account in the store")
 }
 
 // TODO(aqua-security): seal/audit
 fn wipe_crypto_store(store_dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(store_dir) else { return };
+    let Ok(entries) = std::fs::read_dir(store_dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -504,7 +510,9 @@ async fn resolve_oidc_client(
         }
         (None, Some(ruri)) => {
             let cid = config_file.oidc.client_id.clone().ok_or_else(|| {
-                anyhow!("--redirect-uri provided without --client-id, and no cached client_id found")
+                anyhow!(
+                    "--redirect-uri provided without --client-id, and no cached client_id found"
+                )
             })?;
             Ok((cid, ruri))
         }
@@ -515,7 +523,10 @@ async fn resolve_oidc_client(
                     .redirect_uri
                     .clone()
                     .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string());
-                tracing::info!("using cached OIDC credentials from {}", config_path.display());
+                tracing::info!(
+                    "using cached OIDC credentials from {}",
+                    config_path.display()
+                );
                 Ok((cid, ruri))
             } else {
                 let (cid, ruri) = register_oidc_client(&config.siwx_url).await?;
@@ -567,8 +578,7 @@ async fn acquire_session(
     //       zero new config.
     // See `resolve_effective_device_id` for the blank/whitespace handling and
     // docs/ARCHITECTURE.md "Identity and device-id persistence".
-    let effective_device_id =
-        resolve_effective_device_id(config.device_id.as_deref(), &key.did())?;
+    let effective_device_id = resolve_effective_device_id(config.device_id.as_deref(), &key.did())?;
     tracing::info!("effective device_id: {effective_device_id}");
 
     let now_unix = unix_now();
@@ -608,10 +618,17 @@ async fn acquire_session(
             match resolve_identity(&config.matrix_url, &sess.access_token).await {
                 Ok(id) if id.user_id == sess.user_id && id.device_id == sess.device_id => {
                     tracing::info!("cached session validated; skipping auth");
-                    Some((sess.access_token, sess.user_id, sess.device_id, sess.expires_at_unix))
+                    Some((
+                        sess.access_token,
+                        sess.user_id,
+                        sess.device_id,
+                        sess.expires_at_unix,
+                    ))
                 }
                 Ok(_) => {
-                    tracing::warn!("cached session whoami returned different identity; falling through");
+                    tracing::warn!(
+                        "cached session whoami returned different identity; falling through"
+                    );
                     None
                 }
                 Err(e) => {
@@ -619,10 +636,15 @@ async fn acquire_session(
                     None
                 }
             }
-        } else if let (Some(rt), Some(saved_did)) = (sess.refresh_token.as_ref(), sess.did.as_ref()) {
+        } else if let (Some(rt), Some(saved_did)) = (sess.refresh_token.as_ref(), sess.did.as_ref())
+        {
             tracing::info!(
                 "{}; attempting refresh grant (device_id: {})",
-                if force_new { "forcing token rotation" } else { "access token expired" },
+                if force_new {
+                    "forcing token rotation"
+                } else {
+                    "access token expired"
+                },
                 sess.device_id
             );
             match siwx_oidc_auth::refresh(&config.siwx_url, client_id, rt, saved_did).await {
@@ -646,7 +668,12 @@ async fn acquire_session(
                     if let Err(e) = config_file.save(config_path) {
                         tracing::warn!("failed to persist refreshed session: {e:#}");
                     }
-                    Some((refreshed.access_token, refreshed.user_id, refreshed.device_id, refreshed.expires_at_unix))
+                    Some((
+                        refreshed.access_token,
+                        refreshed.user_id,
+                        refreshed.device_id,
+                        refreshed.expires_at_unix,
+                    ))
                 }
                 Err(e) => {
                     tracing::warn!("refresh grant failed: {e:#}; falling through to fresh auth");
@@ -687,11 +714,19 @@ async fn acquire_session(
     tracing::info!(
         "access token acquired (expires in {}s, refresh_token: {})",
         expires_in,
-        if tokens.refresh_token.is_some() { "yes" } else { "no" }
+        if tokens.refresh_token.is_some() {
+            "yes"
+        } else {
+            "no"
+        }
     );
 
     let identity = resolve_identity(&config.matrix_url, &tokens.access_token).await?;
-    tracing::info!("matrix user: {}, device: {}", identity.user_id, identity.device_id);
+    tracing::info!(
+        "matrix user: {}, device: {}",
+        identity.user_id,
+        identity.device_id
+    );
     // The deployed siwx-oidc honours the proposed device scope verbatim. If a
     // server ever ignores it, the divergence guard above would discard the
     // cache on EVERY connect (perpetual full OAuth, store wipes on reauth).
@@ -718,7 +753,12 @@ async fn acquire_session(
     if let Err(e) = config_file.save(config_path) {
         tracing::warn!("failed to persist session cache: {e:#} (continuing anyway)");
     }
-    Ok((tokens.access_token, identity.user_id, identity.device_id, expires_at_unix))
+    Ok((
+        tokens.access_token,
+        identity.user_id,
+        identity.device_id,
+        expires_at_unix,
+    ))
 }
 
 /// True if `err`'s chain carries a Matrix `M_UNKNOWN_TOKEN` (the access token
@@ -730,7 +770,11 @@ async fn acquire_session(
 /// way the `*_with_refresh` wrappers below do, instead of redefining this
 /// string match a second time.
 pub fn is_unknown_token(err: &anyhow::Error) -> bool {
-    let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" | ");
+    let chain: String = err
+        .chain()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(" | ");
     chain.contains("M_UNKNOWN_TOKEN")
         || chain.contains("UnknownToken")
         || chain.contains("Token is not active")
@@ -744,7 +788,11 @@ pub fn is_unknown_token(err: &anyhow::Error) -> bool {
 /// a notify call returns in seconds instead of burning ~5 min of token life per
 /// attempt inside matrix-sdk's internal 5xx retry loop.
 fn is_server_internal_error(err: &anyhow::Error) -> bool {
-    let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" | ");
+    let chain: String = err
+        .chain()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(" | ");
     // `M_UNKNOWN` is Matrix's generic errcode for a 5xx, but `M_UNKNOWN_TOKEN` (an
     // access-token rejection, recovered by `is_unknown_token` + the reactive re-auth in
     // `send_dm_self_healing`) ALSO contains the substring "M_UNKNOWN". Exclude it, else a
@@ -808,7 +856,10 @@ async fn prune_stale_devices(client: &Client, keep_device_id: &str) {
         .filter(|id| id.as_str() != keep_device_id)
         .collect();
     if stale.is_empty() {
-        tracing::info!(keep = keep_device_id, "device prune: no stale devices to remove");
+        tracing::info!(
+            keep = keep_device_id,
+            "device prune: no stale devices to remove"
+        );
         return;
     }
     tracing::info!(
@@ -862,7 +913,8 @@ impl AgentClient {
             _ => {
                 // Genuine multiple live DMs (rare): break ties by newest activity.
                 // Cheap (limit=1) and only on the multi-candidate path.
-                let mut scored: Vec<(matrix_sdk::Room, u8, u64)> = Vec::with_capacity(candidates.len());
+                let mut scored: Vec<(matrix_sdk::Room, u8, u64)> =
+                    Vec::with_capacity(candidates.len());
                 for (room, rank) in candidates {
                     let ts = self
                         .messages(room.room_id().as_str(), 1)
@@ -992,11 +1044,7 @@ impl AgentClient {
             }
             _ => {
                 tracing::info!("bootstrapping cross-signing keys");
-                match client
-                    .encryption()
-                    .bootstrap_cross_signing(None)
-                    .await
-                {
+                match client.encryption().bootstrap_cross_signing(None).await {
                     Ok(()) => {
                         tracing::info!("cross-signing bootstrap complete; device is now verified");
                     }
@@ -1053,8 +1101,8 @@ impl AgentClient {
     /// sync on the same device, which would race to-device (Megolm key) delivery
     /// against the other client and silently drop room keys (H9 single-sync).
     async fn reauth_inner(&mut self, sync_after: bool) -> Result<()> {
-        let key = SiwxKey::from_pem_file(&self.config.key_file)
-            .context("reauth: failed to load key")?;
+        let key =
+            SiwxKey::from_pem_file(&self.config.key_file).context("reauth: failed to load key")?;
         let config_path = self.config.store_dir.join("config.toml");
         let mut config_file = ConfigFile::load(&config_path).unwrap_or_default();
         let (client_id, redirect_uri) =
@@ -1088,7 +1136,9 @@ impl AgentClient {
         {
             Ok(c) => c,
             Err(e) if is_store_mismatch(&e) => {
-                tracing::warn!("reauth: crypto store device_id mismatch; wiping and retrying once: {e:#}");
+                tracing::warn!(
+                    "reauth: crypto store device_id mismatch; wiping and retrying once: {e:#}"
+                );
                 wipe_crypto_store(&self.config.store_dir);
                 build_and_restore(
                     &self.config.matrix_url,
@@ -1502,7 +1552,9 @@ impl AgentClient {
             if let Err(e) = self.reauth_inner(true).await {
                 // Don't hard-fail yet — the current token may still have a few
                 // seconds; let the send attempt (and the reactive path) decide.
-                tracing::warn!("proactive reauth failed: {e:#}; attempting send with current token");
+                tracing::warn!(
+                    "proactive reauth failed: {e:#}; attempting send with current token"
+                );
             }
         }
 
@@ -1517,7 +1569,9 @@ impl AgentClient {
                 );
             }
             Err(e) if is_unknown_token(&e) => {
-                tracing::warn!("send rejected with M_UNKNOWN_TOKEN; re-authenticating and retrying once");
+                tracing::warn!(
+                    "send rejected with M_UNKNOWN_TOKEN; re-authenticating and retrying once"
+                );
                 self.reauth_inner(true)
                     .await
                     .context("re-auth after M_UNKNOWN_TOKEN failed")?;
@@ -2092,7 +2146,11 @@ impl ReplyStream {
         };
         let (head_final, fence_open) = close_open_fence(&head);
         let tail = self.buf[cut..].trim_start_matches('\n').to_string();
-        let new_buf = if fence_open { format!("```\n{tail}") } else { tail };
+        let new_buf = if fence_open {
+            format!("```\n{tail}")
+        } else {
+            tail
+        };
         // Open the continuation WITH its content (not a bare "…") so its push
         // notification, if any, previews real text. Do it FIRST; on failure leave
         // everything untouched.
@@ -2350,9 +2408,17 @@ mod tests {
     fn split_respects_budget_and_preserves_content() {
         let text = "The quick brown fox jumps. ".repeat(1_000); // ~27 KB of sentences
         let chunks = split_for_matrix(&text, 4_000);
-        assert!(chunks.len() >= 5, "expected several chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 5,
+            "expected several chunks, got {}",
+            chunks.len()
+        );
         for c in &chunks {
-            assert!(c.len() <= 4_000, "chunk of {} bytes exceeds budget", c.len());
+            assert!(
+                c.len() <= 4_000,
+                "chunk of {} bytes exceeds budget",
+                c.len()
+            );
         }
         // No words dropped or duplicated.
         let rejoined: String = chunks.join(" ");
@@ -2376,7 +2442,9 @@ mod tests {
     fn split_never_cuts_mid_word_when_a_space_exists() {
         // distinctive tokens so a mid-word cut would be detectable. Kept under
         // the STREAM_MAX_MESSAGES flood guard at this budget (≈37 chunks).
-        let text = (0..2_000).map(|i| format!("tok{i:05} ")).collect::<String>();
+        let text = (0..2_000)
+            .map(|i| format!("tok{i:05} "))
+            .collect::<String>();
         let chunks = split_for_matrix(&text, 500);
         assert!(chunks.len() > 1);
         // Every token in the source survives intact in some chunk.
@@ -2441,12 +2509,20 @@ mod tests {
 
     #[test]
     fn avatar_mime_detects_by_magic_bytes() {
-        assert_eq!(avatar_mime(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap().to_string(), "image/jpeg");
         assert_eq!(
-            avatar_mime(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap().to_string(),
+            avatar_mime(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap().to_string(),
+            "image/jpeg"
+        );
+        assert_eq!(
+            avatar_mime(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+                .unwrap()
+                .to_string(),
             "image/png"
         );
-        assert_eq!(avatar_mime(b"GIF89a\x00\x00").unwrap().to_string(), "image/gif");
+        assert_eq!(
+            avatar_mime(b"GIF89a\x00\x00").unwrap().to_string(),
+            "image/gif"
+        );
         let mut webp = b"RIFF".to_vec();
         webp.extend_from_slice(&[0, 0, 0, 0]);
         webp.extend_from_slice(b"WEBP");
@@ -2458,7 +2534,10 @@ mod tests {
         assert!(avatar_mime(b"not an image at all").is_err());
         assert!(avatar_mime(&[]).is_err());
         // A JPEG file misnamed .png must STILL be detected as jpeg by content.
-        assert_eq!(avatar_mime(&[0xFF, 0xD8, 0xFF, 0x00]).unwrap().to_string(), "image/jpeg");
+        assert_eq!(
+            avatar_mime(&[0xFF, 0xD8, 0xFF, 0x00]).unwrap().to_string(),
+            "image/jpeg"
+        );
     }
 
     #[test]
@@ -2510,8 +2589,7 @@ mod tests {
         let bnd = RoomId::parse("!bNDjtSpZzYnJQTBWvo:matrix.inblock.io").unwrap();
         let ejp = RoomId::parse("!EjpPLRYTPVsWdqrtGc:matrix.inblock.io").unwrap();
         let original = vec![bnd.clone(), bnd.clone(), ejp.clone()];
-        let stale_set: std::collections::HashSet<OwnedRoomId> =
-            [ejp.clone()].into_iter().collect();
+        let stale_set: std::collections::HashSet<OwnedRoomId> = [ejp.clone()].into_iter().collect();
         let (kept, dropped) = partition_dm_rooms(&original, &|r| stale_set.contains(r));
         assert_eq!(kept, vec![bnd], "kept holds the single live DM, deduped");
         assert_eq!(dropped, vec![ejp], "dropped holds the room the owner left");
@@ -2524,7 +2602,11 @@ mod tests {
         let b = RoomId::parse("!bbb:matrix.inblock.io").unwrap();
         let original = vec![a.clone(), b.clone(), a.clone()];
         let (kept, dropped) = partition_dm_rooms(&original, &|_| false);
-        assert_eq!(kept, vec![a, b], "first-seen order preserved, duplicate dropped");
+        assert_eq!(
+            kept,
+            vec![a, b],
+            "first-seen order preserved, duplicate dropped"
+        );
         assert!(dropped.is_empty());
     }
 
@@ -2538,7 +2620,10 @@ mod tests {
         let token_err = anyhow::anyhow!(
             "the homeserver returned an error: M_UNKNOWN_TOKEN: Token is not active"
         );
-        assert!(is_unknown_token(&token_err), "token rejection should be unknown-token");
+        assert!(
+            is_unknown_token(&token_err),
+            "token rejection should be unknown-token"
+        );
         assert!(
             !is_server_internal_error(&token_err),
             "token rejection must NOT be classified as a server internal error"
@@ -2550,7 +2635,10 @@ mod tests {
             is_server_internal_error(&server_err),
             "bare M_UNKNOWN/500 is a server internal error"
         );
-        assert!(!is_unknown_token(&server_err), "a server fault is not a token rejection");
+        assert!(
+            !is_unknown_token(&server_err),
+            "a server fault is not a token rejection"
+        );
     }
 
     #[test]
@@ -2575,12 +2663,20 @@ mod tests {
         // pin the documented AQUA_ prefix + 12 lowercase-hex chars scheme.
         let id = stable_device_id("did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH");
         assert!(id.starts_with("AQUA_"), "expected AQUA_ prefix, got {id}");
-        assert_eq!(id.len(), "AQUA_".len() + 12, "expected 5 + 12 chars, got {id}");
-        assert!(!id.chars().any(|c| c.is_whitespace()), "must contain no whitespace");
+        assert_eq!(
+            id.len(),
+            "AQUA_".len() + 12,
+            "expected 5 + 12 chars, got {id}"
+        );
+        assert!(
+            !id.chars().any(|c| c.is_whitespace()),
+            "must contain no whitespace"
+        );
         assert!(id.is_ascii(), "must be ASCII");
         let hex = &id["AQUA_".len()..];
         assert!(
-            hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "suffix must be lowercase hex, got {hex}"
         );
     }
@@ -2594,8 +2690,14 @@ mod tests {
             "heartbeat"
         );
         // Blank / unset fall back to the derived id.
-        assert_eq!(resolve_effective_device_id(Some("   "), did).unwrap(), stable_device_id(did));
-        assert_eq!(resolve_effective_device_id(None, did).unwrap(), stable_device_id(did));
+        assert_eq!(
+            resolve_effective_device_id(Some("   "), did).unwrap(),
+            stable_device_id(did)
+        );
+        assert_eq!(
+            resolve_effective_device_id(None, did).unwrap(),
+            stable_device_id(did)
+        );
         // Internal whitespace would be truncated by the whitespace-delimited
         // OAuth scope on the server side; it must be rejected loudly.
         assert!(resolve_effective_device_id(Some("my device"), did).is_err());
@@ -2653,7 +2755,11 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap(), "delivered");
-        assert_eq!(calls.get(), 2, "op must run exactly twice: the failing try + the post-reauth retry");
+        assert_eq!(
+            calls.get(),
+            2,
+            "op must run exactly twice: the failing try + the post-reauth retry"
+        );
         assert_eq!(reauth_calls.get(), 1, "reauth must run exactly once");
     }
 
@@ -2672,7 +2778,9 @@ mod tests {
                 let c = c.clone();
                 async move {
                     c.set(c.get() + 1);
-                    Err(anyhow!("the homeserver returned an error: M_UNKNOWN (status_code: 500)"))
+                    Err(anyhow!(
+                        "the homeserver returned an error: M_UNKNOWN (status_code: 500)"
+                    ))
                 }
             },
             move || {
@@ -2689,8 +2797,16 @@ mod tests {
             format!("{:#}", result.unwrap_err()).contains("M_UNKNOWN (status_code: 500)"),
             "the original error must pass through unwrapped, not be masked as a token issue"
         );
-        assert_eq!(calls.get(), 1, "op must run exactly once: no retry on a non-token error");
-        assert_eq!(reauth_calls.get(), 0, "a non-token error must never trigger a reauth");
+        assert_eq!(
+            calls.get(),
+            1,
+            "op must run exactly once: no retry on a non-token error"
+        );
+        assert_eq!(
+            reauth_calls.get(),
+            0,
+            "a non-token error must never trigger a reauth"
+        );
     }
 
     #[tokio::test]
@@ -2719,7 +2835,14 @@ mod tests {
             msg.contains("token refresh after M_UNKNOWN_TOKEN failed"),
             "expected the reauth-failure context, got: {msg}"
         );
-        assert!(msg.contains("network unreachable"), "expected the underlying cause, got: {msg}");
-        assert_eq!(calls.get(), 1, "op must not be retried when reauth itself fails");
+        assert!(
+            msg.contains("network unreachable"),
+            "expected the underlying cause, got: {msg}"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "op must not be retried when reauth itself fails"
+        );
     }
 }
