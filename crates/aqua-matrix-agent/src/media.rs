@@ -198,6 +198,40 @@ impl AgentClient {
         Ok(resp.event_id.to_string())
     }
 
+    /// [`send_file`](Self::send_file) aimed at a specific **joined room** (a
+    /// call room, a group) instead of the DM with a user: same read-from-path,
+    /// extension-guessed MIME (falling back to `application/octet-stream`),
+    /// declared size and optional caption, and no size limit of its own (the
+    /// homeserver's upload cap is the only bound, exactly as for `send_file`).
+    /// In an encrypted room matrix-sdk uploads the bytes encrypted and attaches
+    /// the keys. matrix-sdk derives the `msgtype` from the MIME top-level type,
+    /// so a `.mp4` recording lands as `m.video` and a `.wav` as `m.audio` (size
+    /// only, no duration or dimensions) and anything else as `m.file`.
+    /// Errors before reading the file if the agent has not joined `room_id`.
+    pub async fn send_media_to_room(
+        &self,
+        room_id: &str,
+        path: impl AsRef<Path>,
+        caption: Option<&str>,
+    ) -> Result<String> {
+        let room = self.joined_room(room_id)?;
+        let path = path.as_ref();
+        let data = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let filename = file_name_of(path, "file");
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        let info = AttachmentInfo::File(BaseFileInfo {
+            size: uint(data.len()),
+        });
+        let config = attach_config(info, caption);
+        let resp = room
+            .send_attachment(filename, &mime, data, config)
+            .await
+            .context("failed to send attachment")?;
+        Ok(resp.event_id.to_string())
+    }
+
     /// Send an arbitrary file as `m.file`. MIME is guessed from the extension
     /// (falling back to `application/octet-stream`). `caption` rides as the
     /// message's caption when present.
@@ -587,5 +621,20 @@ mod tests {
         assert_eq!(audio_mime(Path::new("note")).essence_str(), "audio/ogg");
         assert_eq!(audio_mime(Path::new("note.txt")).essence_str(), "audio/ogg");
         assert_eq!(audio_mime(Path::new("clip.mp3")).type_(), mime::AUDIO);
+    }
+
+    #[test]
+    fn room_media_mime_guess_pins_artifact_types() {
+        // `send_media_to_room` guesses the MIME from the extension exactly like
+        // `send_file`, and matrix-sdk picks the msgtype from its top-level type.
+        // Pin what the Scribe artefacts land as in the call room.
+        let guess = |p: &str| mime_guess::from_path(p).first_or_octet_stream();
+        assert_eq!(guess("call.mp4").essence_str(), "video/mp4");
+        assert_eq!(guess("audio.wav").type_(), mime::AUDIO);
+        assert_eq!(guess("notes.md").type_(), mime::TEXT);
+        assert_eq!(
+            guess("sealed.aqua").essence_str(),
+            "application/octet-stream"
+        );
     }
 }

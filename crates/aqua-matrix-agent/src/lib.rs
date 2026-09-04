@@ -30,7 +30,7 @@ use matrix_sdk::{
         },
         OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId,
     },
-    Client, SessionMeta, SessionTokens,
+    Client, RoomState, SessionMeta, SessionTokens,
 };
 use mime::Mime;
 use serde::{Deserialize, Serialize};
@@ -1787,6 +1787,47 @@ impl AgentClient {
             .ok_or_else(|| anyhow!("no DM room with {target} for a streaming reply"))?;
         ReplyStream::start(room).await
     }
+
+    /// Resolve `room_id` to a room this agent has **joined**. Unlike
+    /// [`send_to_room`](Self::send_to_room), which accepts any room the client
+    /// knows about, this rejects invited, left, knocked and banned rooms, so a
+    /// caller never opens a stream or uploads media into a room it cannot post
+    /// to (the send would fail later with a less useful error). Shared by
+    /// [`reply_stream_in_room`](Self::reply_stream_in_room) and
+    /// [`send_media_to_room`](Self::send_media_to_room).
+    pub(crate) fn joined_room(&self, room_id: &str) -> Result<matrix_sdk::Room> {
+        let room_id: &RoomId = room_id
+            .try_into()
+            .map_err(|e| anyhow!("invalid room_id: {e}"))?;
+        let room = self.client.get_room(room_id);
+        require_joined(room_id, room.as_ref().map(|r| r.state()))?;
+        room.ok_or_else(|| anyhow!("room {room_id} not found (agent not joined?)"))
+    }
+
+    /// [`reply_stream`](Self::reply_stream) aimed at a specific **joined room**
+    /// instead of the DM with a user: the same held-back first message,
+    /// throttled `m.replace` edits, rollover and [`ReplyStream::finish`]
+    /// semantics, delivered in `room_id`. This is the path for a status line
+    /// that rewrites in place inside a call room, where every participant reads
+    /// it, rather than in the owner's DM. Errors if the agent has not joined
+    /// `room_id`; callers fall back to [`AgentClient::send_to_room`].
+    pub async fn reply_stream_in_room(&self, room_id: &str) -> Result<ReplyStream> {
+        let room = self.joined_room(room_id)?;
+        ReplyStream::start(room).await
+    }
+}
+
+/// The membership gate behind [`AgentClient::joined_room`], split out so the
+/// error path is unit-testable without a live client. `state` is `None` when
+/// the client does not know the room at all, otherwise the room's own state.
+fn require_joined(room_id: &RoomId, state: Option<RoomState>) -> Result<()> {
+    match state {
+        Some(RoomState::Joined) => Ok(()),
+        Some(other) => Err(anyhow!(
+            "room {room_id} is not joined (state: {other:?}); cannot post there"
+        )),
+        None => Err(anyhow!("room {room_id} not found (agent not joined?)")),
+    }
 }
 
 /// How often to push an in-place edit while streaming. Editing per token would
@@ -2843,6 +2884,32 @@ mod tests {
             calls.get(),
             1,
             "op must not be retried when reauth itself fails"
+        );
+    }
+
+    #[test]
+    fn require_joined_accepts_only_joined_rooms() {
+        // The lookup behind `reply_stream_in_room` / `send_media_to_room`: only a
+        // room the agent has actually joined may be targeted, and the error must
+        // name the room so a caller's log line is actionable.
+        let room = RoomId::parse("!call:matrix.inblock.io").unwrap();
+        assert!(require_joined(&room, Some(RoomState::Joined)).is_ok());
+        for state in [
+            RoomState::Invited,
+            RoomState::Left,
+            RoomState::Knocked,
+            RoomState::Banned,
+        ] {
+            let msg = format!("{:#}", require_joined(&room, Some(state)).unwrap_err());
+            assert!(
+                msg.contains("!call:matrix.inblock.io") && msg.contains("not joined"),
+                "{state:?}: error must name the room and say it is not joined, got: {msg}"
+            );
+        }
+        let msg = format!("{:#}", require_joined(&room, None).unwrap_err());
+        assert!(
+            msg.contains("!call:matrix.inblock.io") && msg.contains("not found"),
+            "unknown room must read as not found, got: {msg}"
         );
     }
 }
